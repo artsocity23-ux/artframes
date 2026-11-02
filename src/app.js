@@ -718,7 +718,7 @@ stage.addEventListener('pointerdown', e => {
   if (e.button === 1 || (e.button === 0 && space.down)) {
     space.used = space.down;
     pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
-    stage.classList.add('panning');
+    flag('panning', true, why(e));
   } else if (e.button === 0 || e.button === 5) {
     if (e.altKey) return pickColor(e);
     startStroke(e);
@@ -748,20 +748,23 @@ stage.addEventListener('pointermove', e => {
   }
 });
 
-const endPointer = () => {
+const endPointer = e => {
   if (stroke) endStroke();
   if (pan) {
     pan = null;
-    stage.classList.remove('panning');
+    flag('panning', false, why(e));
   }
 };
 stage.addEventListener('pointerup', endPointer);
 stage.addEventListener('pointercancel', endPointer);
+stage.addEventListener('lostpointercapture', endPointer); // capture gone without a pointerup: nothing may stay stuck
 // The brush ring follows whichever pointer last moved over the stage, and hides only when that one leaves. A tablet
 // driver may move a mouse pointer alongside the pen; its leave must not take the pen's ring away.
 stage.addEventListener('pointerleave', e => {
-  if (e.pointerId === hoverId) stage.classList.add('out');
+  remember(e);
+  if (e.pointerId === hoverId) flag('out', true, why(e));
 });
+stage.addEventListener('pointerenter', remember);
 stage.addEventListener('contextmenu', e => e.preventDefault());
 
 stage.addEventListener('wheel', e => {
@@ -772,10 +775,115 @@ stage.addEventListener('wheel', e => {
 
 function moveCursor(e) {
   hoverId = e.pointerId;
-  stage.classList.remove('out');
+  flag('out', false, why(e));
   const r = stage.getBoundingClientRect();
   cursorEl.style.transform = `translate(${e.clientX - r.left}px, ${e.clientY - r.top}px)`;
 }
+
+// ---------- cursor: safety and diagnostics ----------
+// Over the sheet the pen's point is marked twice: by a small system cross the OS draws (there even if the ring were
+// lost) and by the ring that shows the brush size. Pen users still reported the cursor vanishing, so whatever
+// changes how it looks goes to artframes.log with its cause, and F9 writes a full snapshot there, with the last
+// pointer and key events, then puts the cursor back.
+
+// The classes that change the cursor over the stage: out (the ring's pointer left), space (Space held: hand),
+// panning (dragging the view).
+function flag(name, on, cause) {
+  if (stage.classList.contains(name) === on) return;
+  stage.classList.toggle(name, on);
+  af.log(`cursor: ${name} ${on ? 'on' : 'off'} (${cause}) stage="${stage.className}"`);
+}
+
+const why = e => (e ? `${e.type} ${e.pointerType}#${e.pointerId} buttons=${e.buttons}` : 'code');
+const describe = el => (!el ? '-' : el.id ? `#${el.id}` : el.classList?.length ? `.${el.classList[0]}` : el.nodeName?.toLowerCase() || '?');
+
+const trail = []; // the last 50 pointer, key and focus events; moves of one pointer over one element merge
+let lastPointerType = null;
+
+function remember(e) {
+  const t = Math.round(performance.now());
+  const on = describe(e.target);
+  if (e.pointerType && e.pointerType !== lastPointerType) {
+    af.log(`cursor: pointer type ${lastPointerType || '-'} -> ${e.pointerType}#${e.pointerId} (${e.type})`);
+    lastPointerType = e.pointerType;
+  }
+  const last = trail[trail.length - 1];
+  if (e.type === 'pointermove' && last?.ev === 'pointermove' && last.id === e.pointerId && last.on === on && last.b === e.buttons) {
+    Object.assign(last, { t, x: Math.round(e.clientX), y: Math.round(e.clientY), n: last.n + 1 });
+    return;
+  }
+  trail.push(e.pointerId === undefined
+    ? { t, ev: e.type, key: e.code, on }
+    : { t, ev: e.type, pt: e.pointerType, id: e.pointerId, b: e.buttons, btn: e.button, x: Math.round(e.clientX), y: Math.round(e.clientY), on, n: 1 });
+  if (trail.length > 50) trail.shift();
+}
+for (const type of ['pointerdown', 'pointerup', 'pointermove', 'pointercancel', 'pointerover', 'pointerout', 'gotpointercapture', 'lostpointercapture', 'keydown', 'keyup', 'blur', 'focus']) {
+  addEventListener(type, remember, { capture: true, passive: true });
+}
+document.addEventListener('visibilitychange', () => remember({ type: `visibility-${document.visibilityState}` }));
+
+function cursorSnapshot() {
+  const c = getComputedStyle(cursorEl);
+  const ring = cursorEl.firstElementChild.getBoundingClientRect();
+  const at = /translate\(([-\d.]+)px, ([-\d.]+)px\)/.exec(cursorEl.style.transform);
+  const last = [...trail].reverse().find(t => t.x !== undefined);
+  const s = {
+    stage: stage.className || '-', systemCursor: getComputedStyle(stage).cursor.slice(0, 32),
+    ring: { display: c.display, opacity: c.opacity, kind: cursorEl.className || '-', at: at ? [+at[1], +at[2]] : null, size: [Math.round(ring.width), Math.round(ring.height)] },
+    stageSize: [stage.clientWidth, stage.clientHeight], hoverId, stroke: !!stroke, pan: !!pan, space: { ...space },
+    focus: document.hasFocus(), visibility: document.visibilityState, active: describe(document.activeElement), modal: $('#modal').childElementCount > 0,
+    under: last ? describe(document.elementFromPoint(last.x, last.y)) : '-',
+    tool: prefs.tool, size: prefs.sizes[prefs.tool], zoom: +view.zoom.toFixed(3), dpr: dpr(), editSketch, playing: !!playing,
+    now: Math.round(performance.now()), trail,
+  };
+  af.log(`cursor snapshot ${JSON.stringify(s)}`);
+}
+
+// F9 ("the cursor is gone"): the snapshot first, then everything that can hide or change the cursor is reset.
+function cursorRescue() {
+  cursorSnapshot();
+  if (!stroke) {
+    space.down = false;
+    pan = null;
+    flag('space', false, 'F9');
+    flag('panning', false, 'F9');
+  }
+  flag('out', false, 'F9');
+  shapeCursor();
+  toast('Стан курсора записано в журнал, курсор повернуто');
+}
+
+// The cross: white with a dark edge, so it shows on paper and on video alike, with a dot at the very point.
+function crossCursor() {
+  const image = scale => {
+    const c = Object.assign(document.createElement('canvas'), { width: 13 * scale, height: 13 * scale });
+    const g = c.getContext('2d');
+    g.scale(scale, scale);
+    const arms = () => {
+      g.beginPath();
+      for (const [x0, y0, x1, y1] of [[6.5, 0.5, 6.5, 4.5], [6.5, 8.5, 6.5, 12.5], [0.5, 6.5, 4.5, 6.5], [8.5, 6.5, 12.5, 6.5]]) {
+        g.moveTo(x0, y0);
+        g.lineTo(x1, y1);
+      }
+      g.stroke();
+    };
+    g.strokeStyle = 'rgba(0, 0, 0, .7)';
+    g.lineWidth = 3;
+    arms();
+    g.fillStyle = 'rgba(0, 0, 0, .7)';
+    g.fillRect(5, 5, 3, 3);
+    g.strokeStyle = g.fillStyle = '#fff';
+    g.lineWidth = 1;
+    arms();
+    g.fillRect(6, 6, 1, 1);
+    return `url(${c.toDataURL()})`;
+  };
+  const sharp = `image-set(${image(1)} 1x, ${image(2)} 2x) 6 6, crosshair`;
+  const style = document.createElement('style');
+  style.textContent = `#stage { cursor: ${CSS.supports('cursor', sharp) ? sharp : `${image(1)} 6 6, crosshair`}; }`;
+  document.head.append(style);
+}
+crossCursor();
 
 function shapeCursor() {
   if (!doc) return;
@@ -1469,6 +1577,7 @@ const KEYS = [
   ['Ctrl+Z', 'скасувати · Ctrl+Shift+Z / Ctrl+Y — повторити'],
   ['Ctrl+S', 'зберегти · Ctrl+O відкрити · Ctrl+N новий'],
   ['Ctrl+E', 'експорт GIF / MP4 / WebM / PNG'],
+  ['F9', 'курсор зник: повернути його й записати стан у журнал'],
 ];
 
 function helpDialog() {
@@ -1760,6 +1869,11 @@ function toggleMirror() {
 const typing = t => t?.matches?.('input[type=number], input[type=text], textarea, select');
 
 addEventListener('keydown', e => {
+  if (e.code === 'F9') {
+    e.preventDefault();
+    if (doc) cursorRescue();
+    return;
+  }
   if ($('#modal').childElementCount) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -1805,7 +1919,7 @@ addEventListener('keydown', e => {
     if (!e.repeat) {
       space.down = true;
       space.used = false;
-      stage.classList.add('space');
+      flag('space', true, 'Space down');
     }
   } else if (e.altKey && (k === 'ArrowLeft' || k === 'ArrowRight')) {
     moveFrame(cur, cur + (k === 'ArrowLeft' ? -1 : 1));
@@ -1839,14 +1953,15 @@ addEventListener('keydown', e => {
 addEventListener('keyup', e => {
   if (e.code !== 'Space' || !space.down) return;
   space.down = false;
-  stage.classList.remove('space');
+  flag('space', false, 'Space up');
   if (!space.used && !typing(e.target) && !$('#modal').childElementCount) togglePlay();
   e.preventDefault();
 });
 
-addEventListener('blur', () => {
+addEventListener('blur', e => {
+  if (e.target !== window) return; // focus moving between buttons is not the window losing it
   space.down = false;
-  stage.classList.remove('space');
+  flag('space', false, 'window blur');
 });
 
 // ---------- start ----------

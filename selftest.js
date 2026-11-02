@@ -653,6 +653,33 @@ module.exports = async function selftest({ win, out }) {
     ['hover', 'afterStroke', 'backInRange', 'otherPointerLeft', 'releasedOutside', 'ownReference', 'backToFrames', 'whereToastWas'].every(k => okSeen(pointer[k])) &&
       pointer.awayHidden && pointer.whereToastWas.faded,
     pointer);
+
+  // The safety net: a system cross is always set over the stage; with Space stuck down the ring stays (dimmed);
+  // F9 logs a snapshot and puts everything back; every change of the cursor is in the log with its cause.
+  const net = { cross: await js("getComputedStyle(document.getElementById('stage')).cursor") };
+  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Space' }); // held, as if its key-up got lost
+  await wait(80);
+  await hover(line(Q, P, 4));
+  net.spaceHeld = { ...(await under(P)), stage: await js("document.getElementById('stage').className") };
+  await key('F9');
+  await wait(150);
+  net.afterF9 = await js("({ stage: document.getElementById('stage').className, toast: document.getElementById('toast').textContent })");
+  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Space' });
+  await wait(80);
+  const logText = fs.existsSync(path.join(out, 'artframes.log')) ? fs.readFileSync(path.join(out, 'artframes.log'), 'utf8') : '';
+  const snapLine = logText.split('\n').reverse().find(l => l.includes('cursor snapshot {'));
+  const snap = snapLine ? JSON.parse(snapLine.slice(snapLine.indexOf('{'))) : null;
+  net.log = {
+    hiddenWithCause: /cursor: out on \(pointerleave pen#\d+/.test(logText),
+    shownWithCause: /cursor: out off \(pointermove pen#\d+/.test(logText),
+    spaceLogged: /cursor: space on \(Space down\)/.test(logText) && /cursor: space off \(F9\)/.test(logText),
+    snapshot: snap && { stage: snap.stage, focus: snap.focus, ring: snap.ring, trail: snap.trail.length, last: snap.trail[snap.trail.length - 1] },
+  };
+  check('cursor safety net: system cross, F9, log',
+    /^image-set\(|^url\(/.test(net.cross) && net.spaceHeld.shown && net.spaceHeld.off < 3 && /space/.test(net.spaceHeld.stage) &&
+      !/space|out|panning/.test(net.afterF9.stage) && /журнал/.test(net.afterF9.toast) &&
+      net.log.hiddenWithCause && net.log.shownWithCause && net.log.spaceLogged && !!snap && /space/.test(snap.stage) && snap.trail.length >= 10,
+    { ...net, cross: net.cross.slice(0, 40) });
   await js(`__af.open(${JSON.stringify(project)})`);
 
   // Donate window from donate.json.

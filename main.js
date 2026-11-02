@@ -12,9 +12,10 @@ const SELFTEST = process.argv.includes('--selftest') || BENCH || DEMO;
 const IS_MAC = process.platform === 'darwin';
 // An installed build keeps the log and the autosave in the per-user app data folder, a source checkout beside the code.
 const DATA = app.isPackaged ? app.getPath('userData') : ROOT;
-const LOG = path.join(DATA, 'artframes.log');
 const testArg = process.argv.indexOf(BENCH ? '--bench' : DEMO ? '--demo' : '--selftest');
 const OUT = SELFTEST ? path.resolve(process.argv[testArg + 1] || 'selftest-out') : null;
+// Test runs log into their own folder, so they never mix with the log of the copy someone is drawing in.
+const LOG = path.join(SELFTEST ? OUT : DATA, 'artframes.log');
 const AUTOSAVE = SELFTEST ? path.join(OUT, 'autosave.artframes') : path.join(DATA, 'autosave.artframes');
 
 // Donation options live in donate.json; entries left empty are not shown.
@@ -28,9 +29,8 @@ let closing = false;
 let pendingFile = fileFromArgs(process.argv);
 
 function log(...parts) {
-  if (SELFTEST) return;
   try {
-    fs.mkdirSync(DATA, { recursive: true });
+    fs.mkdirSync(path.dirname(LOG), { recursive: true });
     if (fs.existsSync(LOG) && fs.statSync(LOG).size > 256 * 1024) fs.renameSync(LOG, `${LOG}.old`);
     fs.appendFileSync(LOG, `${new Date().toLocaleString('sv')} ${parts.join(' ')}\n`);
   } catch {
