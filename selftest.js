@@ -76,6 +76,12 @@ window.__t = {
   },
   refPixel(x, y) { return [...__af.readLayer('ref', x, y, 1, 1)]; },
   scenePixel(x, y) { return [...__af.readLayer('scene', x, y, 1, 1)]; },
+  // The brush cursor drawn over the stage: whether it shows, and where (window coordinates of its centre).
+  cursor() {
+    const st = document.getElementById('stage'), c = document.getElementById('cursor'), r = st.getBoundingClientRect();
+    const m = /translate\\(([-\\d.]+)px, ([-\\d.]+)px\\)/.exec(c.style.transform) || [0, NaN, NaN];
+    return { shown: getComputedStyle(c).display !== 'none', x: +m[1] + r.left, y: +m[2] + r.top };
+  },
   sketchInk() {
     const d = __af.readLayer('sketch');
     let n = 0;
@@ -579,6 +585,76 @@ module.exports = async function selftest({ win, out }) {
     { pxNo, pxYes, plain, sketchSaved, reopened: reopenedSketch });
   await js(`__af.open(${JSON.stringify(project)})`);
 
+  // ---------- 11. the pen's cursor never gets lost ----------
+  // The stage hides the system cursor and draws its own ring. Whatever the pen and the tablet driver do, the ring must
+  // be back under the pen as soon as it hovers over the sheet: after a stroke, after leaving the hover range, when
+  // another pointer (the driver's mouse) leaves the stage, after a stroke released outside, across Tab. And a faded
+  // toast must not keep catching the pen.
+  await wait(200);
+  await measure();
+  const penAt = ([x, y], buttons = 0, type = 'mouseMoved') =>
+    cdp('Input.dispatchMouseEvent', { type, x, y, button: type === 'mouseMoved' && !buttons ? 'none' : 'left', buttons, clickCount: 1, pointerType: 'pen', force: buttons ? 0.6 : 0 });
+  const mouseAt = ([x, y]) => cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0, pointerType: 'mouse' });
+  const hover = async pts => {
+    for (const p of pts) {
+      await penAt(p);
+      await wait(12);
+    }
+    await wait(60);
+  };
+  const under = async p => {
+    const c = await js('__t.cursor()');
+    return { shown: c.shown, off: +Math.hypot(c.x - p[0], c.y - p[1]).toFixed(1) };
+  };
+  const side = await js("(() => { const r = document.getElementById('side').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()");
+  const P = at(0.5, 0.5);
+  const Q = at(0.62, 0.42);
+  const pointer = {};
+  await key('B');
+  await hover(line(at(0.3, 0.5), P, 8));
+  pointer.hover = await under(P);
+  await pen(line(P, at(0.56, 0.62), 12).map(p => [...p, 0.6]));
+  await hover(line(at(0.56, 0.62), Q, 6));
+  pointer.afterStroke = await under(Q);
+  await penAt([-30, Q[1]]); // out of the window: like lifting the pen out of hover range
+  await wait(100);
+  pointer.awayHidden = !(await js('__t.cursor()')).shown;
+  await hover(line(at(0.03, 0.42), Q, 8));
+  pointer.backInRange = await under(Q);
+  await mouseAt(at(0.4, 0.4)); // the driver's mouse is over the stage too...
+  await wait(40);
+  await hover([P]);
+  await mouseAt(side); // ...and leaves it while the pen stays
+  await wait(80);
+  await hover(line(P, Q, 6));
+  pointer.otherPointerLeft = await under(Q);
+  await pen(line(Q, side, 14).map(p => [...p, 0.6])); // a stroke that ends over the side panel
+  await hover(line(at(0.97, 0.45), P, 8));
+  pointer.releasedOutside = await under(P);
+  await key('Tab');
+  await hover(line(P, Q, 4));
+  pointer.ownReference = await under(Q);
+  await key('Tab');
+  await hover(line(Q, P, 4));
+  pointer.backToFrames = await under(P);
+  // A clickable toast ("show in folder") fades out; the place where it was must belong to the stage again.
+  await js(`__af.exportTo({ kind: 'gif', target: ${JSON.stringify(path.join(out, 'toast.gif'))}, name: 'toast', scale: 0.25, withRef: false })`);
+  const toastSpot = await js(`(async () => {
+    const t = document.getElementById('toast');
+    const r = t.getBoundingClientRect();
+    const spot = [r.x + r.width / 2, r.y + r.height / 2];
+    for (let k = 0; k < 80 && t.classList.contains('show'); k++) await new Promise(res => setTimeout(res, 100));
+    return { spot, faded: !t.classList.contains('show') };
+  })()`);
+  await hover([toastSpot.spot]);
+  pointer.whereToastWas = { ...(await under(toastSpot.spot)), faded: toastSpot.faded };
+  const okSeen = v => v.shown && v.off < 3;
+  check('pen cursor stays visible',
+    ['hover', 'afterStroke', 'backInRange', 'otherPointerLeft', 'releasedOutside', 'ownReference', 'backToFrames', 'whereToastWas'].every(k => okSeen(pointer[k])) &&
+      pointer.awayHidden && pointer.whereToastWas.faded,
+    pointer);
+  await js(`__af.open(${JSON.stringify(project)})`);
+
   // Donate window from donate.json.
   await js('af.openDonate(); true');
   let donateWin = null;
@@ -613,7 +689,7 @@ module.exports = async function selftest({ win, out }) {
   await shot('help.png');
   await key('Escape');
 
-  // ---------- 11. a big brush on a 4K sheet stays smooth ----------
+  // ---------- 12. a big brush on a 4K sheet stays smooth ----------
   await js('__af.setDoc({ width: 3840, height: 2160, fps: 24 })');
   await wait(300);
   await measure();

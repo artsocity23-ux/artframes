@@ -645,6 +645,7 @@ function go(i) {
 
 let stroke = null;
 let pan = null;
+let hoverId = null; // the pointer the brush ring follows
 const space = { down: false, used: false };
 
 function pressureOf(ev) {
@@ -713,6 +714,7 @@ function pickColor(e) {
 
 stage.addEventListener('pointerdown', e => {
   if (!doc || $('#modal').childElementCount) return;
+  moveCursor(e);
   if (e.button === 1 || (e.button === 0 && space.down)) {
     space.used = space.down;
     pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
@@ -755,8 +757,11 @@ const endPointer = () => {
 };
 stage.addEventListener('pointerup', endPointer);
 stage.addEventListener('pointercancel', endPointer);
-stage.addEventListener('pointerleave', () => stage.classList.add('out'));
-stage.addEventListener('pointerenter', () => stage.classList.remove('out'));
+// The brush ring follows whichever pointer last moved over the stage, and hides only when that one leaves. A tablet
+// driver may move a mouse pointer alongside the pen; its leave must not take the pen's ring away.
+stage.addEventListener('pointerleave', e => {
+  if (e.pointerId === hoverId) stage.classList.add('out');
+});
 stage.addEventListener('contextmenu', e => e.preventDefault());
 
 stage.addEventListener('wheel', e => {
@@ -766,6 +771,8 @@ stage.addEventListener('wheel', e => {
 }, { passive: false });
 
 function moveCursor(e) {
+  hoverId = e.pointerId;
+  stage.classList.remove('out');
   const r = stage.getBoundingClientRect();
   cursorEl.style.transform = `translate(${e.clientX - r.left}px, ${e.clientY - r.top}px)`;
 }
@@ -1480,7 +1487,10 @@ function toast(text, error = false, onClick = null) {
   el.onclick = onClick;
   if (onClick) el.title = 'Показати в папці';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), error ? 6000 : onClick ? 5000 : 2200);
+  toastTimer = setTimeout(() => {
+    el.classList.remove('show');
+    el.style.pointerEvents = 'none'; // a faded toast must not keep catching the pen over the stage
+  }, error ? 6000 : onClick ? 5000 : 2200);
 }
 
 async function guarded(fn) {
