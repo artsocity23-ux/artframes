@@ -8,6 +8,7 @@
   --dim: #8b91a0;
   --accent: #ff5a4e;
   --ok: #5fd38d;
+  --sketch: #6aa8ff; /* the own reference: blue, like an animator's construction pencil */
   --tw: 72px;
   --th: 40px;
 }
@@ -130,8 +131,9 @@ input[type=range]::-webkit-slider-thumb {
   min-width: 0;
 }
 
-#tools button { padding: 0 10px 0 8px; }
-#tools button span { font-size: 12.5px; }
+#tools button, #target button { padding: 0 10px 0 8px; }
+#tools button span, #target button span { font-size: 12.5px; }
+#target button[data-target=sketch].on { background: rgba(106, 168, 255, .16); box-shadow: inset 0 0 0 1px var(--sketch); color: #d6e6ff; }
 
 .size { display: flex; align-items: center; gap: 6px; margin-left: 8px; }
 .size input[type=range] { width: 110px; }
@@ -221,6 +223,30 @@ main {
 }
 #hud b { color: var(--text); font-weight: 600; }
 
+/* Drawing the own reference: a blue frame round the stage, a note on top, the timeline steps back. */
+#modeBadge {
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  padding: 5px 12px;
+  border-radius: 7px;
+  background: rgba(24, 42, 70, .92);
+  box-shadow: 0 0 0 1px rgba(106, 168, 255, .55);
+  color: #dbe8ff;
+  font-size: 12.5px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+#modeBadge kbd { margin: 0 5px 0 10px; }
+body.sketching #modeBadge { display: flex; }
+body.sketching #stage::after { content: ""; position: absolute; inset: 0; box-shadow: inset 0 0 0 2px var(--sketch); pointer-events: none; z-index: 2; }
+body.sketching #cursor i { box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), inset 0 0 0 1.5px var(--sketch); }
+body.sketching #strip { opacity: .45; }
+
 #dropHint {
   position: absolute;
   inset: 16px;
@@ -293,6 +319,10 @@ button.wide {
 button.wide:hover { background: #2f3440; border-color: #3b414d; }
 button.wide kbd { margin-left: auto; }
 button.ghostbtn { background: none; color: var(--dim); }
+#sketchMode.on { background: rgba(106, 168, 255, .16); border-color: var(--sketch); color: #d6e6ff; }
+.pair { display: flex; gap: 6px; }
+.pair button.wide { flex: 1; min-width: 0; padding: 0 6px; }
+.dimkey { color: var(--dim); font-size: 11px; margin-left: 4px; }
 
 .refname { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 .refname b { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -471,8 +501,8 @@ button.labeled { padding: 0 10px 0 8px; color: #c9cdd6; }
 
 #transport, #bar { white-space: nowrap; }
 @media (max-width: 1440px) {
-  #tools button span, .seg span, .hold span { display: none; }
-  #tools button { padding: 0 8px; }
+  #tools button span, #target button span, .seg span, .hold span { display: none; }
+  #tools button, #target button { padding: 0 8px; }
   button.labeled { font-size: 0; gap: 0; padding: 0 8px; }
   #frameInfo { min-width: 0; }
 }

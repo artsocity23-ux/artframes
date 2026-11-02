@@ -1,7 +1,8 @@
 // End-to-end check without a human: `electron . --selftest <outdir>`.
 // Draws a bouncing ball over several frames with real mouse input and a pen with pressure (Chrome DevTools input,
 // which arrives as PointerEvents of type "pen"), checks the onion skin, undo and frame operations, plays it back,
-// generates a test video with a frame counter and a tone, traces over it, and exports PNG, GIF, WebM and MP4.
+// generates a test video with a frame counter and a tone, traces over it, draws an own reference under the frames,
+// and exports PNG, GIF, WebM and MP4.
 // Writes report.json plus screenshots; exits 1 if any check fails.
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');
@@ -74,6 +75,30 @@ window.__t = {
     return { red, green };
   },
   refPixel(x, y) { return [...__af.readLayer('ref', x, y, 1, 1)]; },
+  scenePixel(x, y) { return [...__af.readLayer('scene', x, y, 1, 1)]; },
+  sketchInk() {
+    const d = __af.readLayer('sketch');
+    let n = 0;
+    for (let k = 3; k < d.length; k += 4) if (d[k] > 127) n++;
+    return n;
+  },
+  // A solid pixel inside the own reference where no frame has ink: where to look for it in the scene and exports.
+  sketchSpot() {
+    const s = __af.readLayer('sketch'), W = __af.doc.width, row = W * 4 * 2;
+    const frames = __af.doc.frames.map((f, i) => __af.readFrame(i)).filter(Boolean);
+    for (let k = 3 + row; k < s.length - row; k += 4) {
+      if (s[k] < 255 || s[k - row] < 255 || s[k + row] < 255 || frames.some(d => d[k] > 0)) continue;
+      const p = (k - 3) / 4;
+      return [p % W, Math.floor(p / W)];
+    }
+    return null;
+  },
+  // Share of the inked pixels of a that are inked in b too.
+  covered(a, b) {
+    let n = 0, both = 0;
+    for (let k = 3; k < a.length; k += 4) if (a[k] > 127) { n++; if (b[k] > 127) both++; }
+    return n ? both / n : 0;
+  },
   pixel(canvas, x, y) {
     const c = document.createElement('canvas');
     c.width = 1; c.height = 1;
@@ -480,6 +505,80 @@ module.exports = async function selftest({ win, out }) {
 
   await js(`__af.open(${JSON.stringify(project)})`);
 
+  // ---------- 10. own reference: a drawing of its own under every frame ----------
+  // Tab switches the brush to it; a calligraphic wave drawn there must not touch any frame, must show under the
+  // other frames, hide with Shift+R, undo like a stroke, copy to and from frames, export only when asked and
+  // travel in the project file.
+  await wait(300);
+  await measure();
+  await key('Home');
+  const inksBefore = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
+  await key('Tab');
+  const mode = await js(`({ edit: __af.editSketch, badge: getComputedStyle(document.getElementById('modeBadge')).display !== 'none',
+    button: document.querySelector('#target [data-target=sketch]').classList.contains('on') })`);
+  await key('F');
+  await key('1');
+  await js('__af.setSize(28); true');
+  await mouse(Array.from({ length: 70 }, (_, k) => at(0.08 + (0.84 * k) / 69, 0.12 + 0.05 * Math.sin(k / 5))));
+  const drawnSketch = await js('__t.sketchInk()');
+  const inksAfter = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
+  await shot('sketch.png');
+  await key('Tab');
+  const backToFrames = !(await js('__af.editSketch'));
+  await key('Right');
+  await key('Right');
+  const spot = await js('__t.sketchSpot()');
+  const sceneShown = spot && (await js(`__t.scenePixel(${spot[0]}, ${spot[1]})`));
+  await key('R', ['shift']);
+  const sceneHidden = spot && (await js(`__t.scenePixel(${spot[0]}, ${spot[1]})`));
+  await key('R', ['shift']);
+  await key('Z', ['control']);
+  const sketchUndone = await js('__t.sketchInk()');
+  await key('Y', ['control']);
+  const sketchRedone = await js('__t.sketchInk()');
+  check('own reference: drawn on its own layer, under every frame',
+    mode.edit && mode.badge && mode.button && backToFrames && drawnSketch > 3000 && JSON.stringify(inksAfter) === JSON.stringify(inksBefore) &&
+      !!spot && Math.max(...sceneShown.slice(0, 3)) < 200 && sceneHidden.slice(0, 3).every(v => v === 255) && sketchUndone === 0 && sketchRedone === drawnSketch,
+    { mode, backToFrames, drawnSketch, inksBefore, inksAfter, spot, sceneShown, sceneHidden, sketchUndone, sketchRedone });
+
+  // Frame 1's ball goes into the own reference; then the reference goes into the last frame, under its drawing.
+  await key('Home');
+  await js("document.getElementById('frameToSketch').click(); true");
+  const intoRef = await js("__t.covered(__af.readFrame(0), __af.readLayer('sketch'))");
+  await key('End');
+  const inkLast = await js('__t.ink(__af.cur)');
+  await js("document.getElementById('sketchToFrame').click(); true");
+  const intoFrame = await js("({ ink: __t.ink(__af.cur), covered: __t.covered(__af.readLayer('sketch'), __af.readFrame(__af.cur)) })");
+  await key('Z', ['control']);
+  const restored = await js('__t.ink(__af.cur)');
+  check('own reference: frame to reference and back', intoRef > 0.99 && intoFrame.ink > inkLast && intoFrame.covered > 0.99 && restored === inkLast,
+    { intoRef, inkLast, intoFrame, restored });
+
+  // Exports leave it out unless asked; the project file keeps it with its opacity.
+  const noSketch = path.join(out, 'png-no-sketch');
+  const withSketch = path.join(out, 'png-sketch');
+  await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(noSketch)}, name: 'a', scale: 1, withRef: false })`);
+  await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(withSketch)}, name: 'a', scale: 1, withRef: false, withSketch: true })`);
+  const firstPixel = dir => js(`(async () => {
+    const bmp = await createImageBitmap(new Blob([await af.read(${JSON.stringify(path.join(dir, 'a_0001.png'))})]));
+    return __t.pixel(bmp, ${spot ? spot.join(', ') : '0, 0'});
+  })()`);
+  const pxNo = await firstPixel(noSketch);
+  const pxYes = await firstPixel(withSketch);
+  await js("(() => { const r = document.getElementById('sketchOpacity'); r.value = 35; r.dispatchEvent(new Event('input', { bubbles: true })); return true; })()");
+  const sketchSaved = await js('__t.sketchInk()');
+  const ownFile = path.join(out, 'own-reference.artframes');
+  await js(`__af.save(${JSON.stringify(ownFile)})`);
+  await js(`__af.open(${JSON.stringify(project)})`);
+  const plain = await js('__af.sketch');
+  await js(`__af.open(${JSON.stringify(ownFile)})`);
+  const reopenedSketch = await js('({ ...__af.sketch, ink: __t.sketchInk(), edit: __af.editSketch })');
+  check('own reference: exported only when asked, saved in the project',
+    pxNo.slice(0, 3).every(v => v === 255) && Math.max(...pxYes.slice(0, 3)) < 80 && !plain.drawn &&
+      reopenedSketch.drawn && reopenedSketch.ink === sketchSaved && Math.abs(reopenedSketch.opacity - 0.35) < 1e-6 && reopenedSketch.visible && !reopenedSketch.edit,
+    { pxNo, pxYes, plain, sketchSaved, reopened: reopenedSketch });
+  await js(`__af.open(${JSON.stringify(project)})`);
+
   // Donate window from donate.json.
   await js('af.openDonate(); true');
   let donateWin = null;
@@ -514,7 +613,7 @@ module.exports = async function selftest({ win, out }) {
   await shot('help.png');
   await key('Escape');
 
-  // ---------- 10. a big brush on a 4K sheet stays smooth ----------
+  // ---------- 11. a big brush on a 4K sheet stays smooth ----------
   await js('__af.setDoc({ width: 3840, height: 2160, fps: 24 })');
   await wait(300);
   await measure();
@@ -567,6 +666,33 @@ module.exports = async function selftest({ win, out }) {
   await key('Right');
   await wait(500);
   await shot('demo.png');
+
+  // ---------- demo picture: calligraphic loops as the own reference, a ball riding along them ----------
+  await js('__af.setDoc({ width: 1920, height: 1080, fps: 24 }); true');
+  await wait(300);
+  await measure();
+  const loops = u => {
+    const t = u * Math.PI * 6;
+    return [0.12 + 0.76 * u - 0.06 * Math.sin(t), 0.52 - 0.17 * Math.cos(t)];
+  };
+  await key('Tab');
+  await key('F');
+  await key('2');
+  await js('__af.setSize(40); true');
+  await pen(Array.from({ length: 240 }, (_, k) => [...at(...loops(k / 239)), 0.55 + 0.45 * Math.sin((Math.PI * k) / 239)]));
+  await key('Tab');
+  await key('B');
+  await key('1');
+  await js('__af.setSize(9); true');
+  for (let i = 0; i < 8; i++) {
+    if (i) await key('N');
+    const [fx, fy] = loops((i + 0.5) / 8);
+    await pen(ring(fx, fy, 0.024, 0.043, 48).map(([x, y], k, a) => [x, y, 0.45 + 0.55 * Math.sin((Math.PI * k) / (a.length - 1))]));
+  }
+  await key('Home');
+  for (let k = 0; k < 4; k++) await key('Right');
+  await wait(500);
+  await shot('own-reference.png');
 
   report.errors = report.console.filter(l => /^(error|3):/i.test(l) || /Uncaught|TypeError|ReferenceError/.test(l));
   check('no errors in the console', !report.errors.length, report.errors);

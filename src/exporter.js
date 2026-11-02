@@ -28,7 +28,7 @@ class Cancelled extends Error {}
 
 // src: { width, height, fps, frames, ticks (start tick per frame + total), frameAtTick(t), video, image,
 //        render(W, H, { frame, under, image, paper }) -> RGBA, unpremultiply(px) }
-// job: { kind: 'png' | 'gif' | 'mp4' | 'webm', target, name, scale, withRef, transparent, audio }
+// job: { kind: 'png' | 'gif' | 'mp4' | 'webm', target, name, scale, withRef, withSketch, transparent, audio }
 export async function runExport(src, job, progress, cancel) {
   const even = job.kind === 'mp4' || job.kind === 'webm';
   const fit = n => {
@@ -43,7 +43,8 @@ export async function runExport(src, job, progress, cancel) {
   const check = () => {
     if (cancel.requested) throw new Cancelled();
   };
-  const picture = (frame, under) => src.render(W, H, { frame, under, image, paper });
+  const sketch = !!job.withSketch;
+  const picture = (frame, under) => src.render(W, H, { frame, under, image, paper, sketch });
 
   // Ticks to render: the animation, or the whole video at the animation's frame rate.
   const total = video ? video.ticks() : src.ticks[src.frames.length];
@@ -177,7 +178,7 @@ async function overVideo(src, job, { W, H, codec, video, frameAt, progress, canc
         if (t0 === null) t0 = sample.timestamp;
         const t = Math.floor((sample.timestamp - t0 + (sample.duration || 1 / video.fps) / 2) * src.fps);
         sample.drawWithFit(subCtx, { fit: 'fill' });
-        const px = src.render(W, H, { frame: frameAt(t), under: sub });
+        const px = src.render(W, H, { frame: frameAt(t), under: sub, sketch: !!job.withSketch });
         return rgbaSample(px, W, H, sample.timestamp, sample.duration);
       },
     },

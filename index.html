@@ -19,6 +19,11 @@
     <button data-tool="flat" title="Широка кисть (F): товщина залежить від напрямку руху"><svg viewBox="0 0 24 24"><rect x="3.5" y="10.6" width="17" height="2.8" rx=".8" class="fill" transform="rotate(-45 12 12)"/></svg><span>Широка</span></button>
     <button data-tool="eraser" title="Гумка (E) · кінчик-гумка пера теж стирає"><svg viewBox="0 0 24 24"><path d="M8.5 20h11"/><path d="M5.2 14.8l8.3-8.3a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11.5 18.5H8.9z"/><path d="M9.5 10.5l5 5"/></svg><span>Гумка</span></button>
   </div>
+  <div class="sep"></div>
+  <div class="group" id="target">
+    <button data-target="frames" title="Малювати кадри анімації (Tab — перемкнути)"><svg viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="12" height="12" rx="1.5"/><path d="M7.5 4.5h11.5a1.5 1.5 0 0 1 1.5 1.5v11.5"/></svg><span>Кадри</span></button>
+    <button data-target="sketch" title="Малювати свій референс: шар під усіма кадрами, наприклад каліграфія, по якій потім анімуєш (Tab)"><svg viewBox="0 0 24 24"><path d="M3.5 15.5l8.5 4.5 8.5-4.5"/><path d="M15 3.5l3 3-7.5 7.5H7.5v-3z"/></svg><span>Референс</span></button>
+  </div>
   <div class="size" title="Розмір кисті ([ і ])">
     <input type="range" id="sizeRange" min="0" max="1000" step="1">
     <input type="number" id="sizeNum" min="1" max="400" step="1">
@@ -50,6 +55,7 @@
     <canvas id="gl"></canvas>
     <div id="cursor"><i></i></div>
     <div id="hud"></div>
+    <div id="modeBadge">Малюєш свій референс: він лежить під усіма кадрами<kbd>Tab</kbd>назад до кадрів</div>
     <div id="dropHint">Відпусти файл: картинка чи відео стане референсом, .artframes відкриється як проєкт</div>
   </section>
 
@@ -79,7 +85,7 @@
       <h2>Референс <kbd>R</kbd></h2>
       <div id="refEmpty">
         <p class="hint">Картинка або відео під кадрами: обводити рух чи домальовувати приколи поверх відео. Можна просто перетягнути файл у вікно.</p>
-        <button class="wide" id="refLoad">Завантажити картинку чи відео…<kbd>Ctrl+I</kbd></button>
+        <button class="wide" id="refLoad" title="Завантажити картинку чи відео (Ctrl+I)">Картинка чи відео…<kbd>Ctrl+I</kbd></button>
       </div>
       <div id="refInfo" hidden>
         <div class="refname"><b id="refName"></b><button id="refRemove" class="x" title="Прибрати референс">×</button></div>
@@ -93,6 +99,19 @@
         </div>
         <button class="wide ghostbtn" id="refReplace">Замінити…</button>
       </div>
+    </section>
+
+    <section>
+      <h2>Свій референс <kbd>Tab</kbd></h2>
+      <p class="hint" id="sketchHint">Намалюй каліграфію, траєкторію чи макет на окремому шарі під усіма кадрами й анімуй поверх. Лягає над картинкою чи відео.</p>
+      <button class="wide" id="sketchMode"></button>
+      <label class="row toggle"><input type="checkbox" id="sketchVisible"><span>Показувати <small class="dimkey">Shift+R</small></span></label>
+      <label class="row"><span>Прозорість</span><input type="range" id="sketchOpacity" min="5" max="100" step="5"><output id="sketchOpacityOut"></output></label>
+      <div class="pair">
+        <button class="wide" id="frameToSketch" title="Додати малюнок поточного кадру у свій референс">Кадр → реф.</button>
+        <button class="wide" id="sketchToFrame" title="Додати свій референс у поточний кадр (під його малюнок)">Реф. → кадр</button>
+      </div>
+      <button class="wide ghostbtn" id="sketchClear">Очистити свій референс</button>
     </section>
 
     <section>
@@ -140,6 +159,7 @@
   <span><kbd>Пробіл</kbd>грати</span>
   <span><kbd>O</kbd>калька</span>
   <span><kbd>R</kbd>референс</span>
+  <span><kbd>Tab</kbd>малювати референс</span>
   <span><kbd>−</kbd><kbd>=</kbd>утримання</span>
   <span><kbd>Alt</kbd>+клік піпетка</span>
   <span><kbd>F1</kbd>усі клавіші</span>

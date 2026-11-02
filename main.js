@@ -193,15 +193,17 @@ ipcMain.handle('af:range-close', (e, file) => {
 
 // ---------- project files ----------
 // A project is one JSON file: settings plus every drawing as base64 PNG. Videos stay where they are (path only),
-// a reference picture is embedded so the project still opens on another computer.
+// a reference picture is embedded so the project still opens on another computer. The own (drawn) reference is
+// one more PNG with its visibility and opacity; older files simply have none.
 
-function encodeProject({ meta, frames, refBytes }) {
+function encodeProject({ meta, frames, refBytes, sketch }) {
   const reference = meta.reference && { ...meta.reference, data: refBytes ? Buffer.from(refBytes).toString('base64') : null };
   return JSON.stringify({
     format: 'artframes',
     version: 1,
     ...meta,
     reference,
+    sketch: sketch && { ...sketch, png: Buffer.from(sketch.png).toString('base64') },
     frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png).toString('base64') : null })),
   });
 }
@@ -209,10 +211,11 @@ function encodeProject({ meta, frames, refBytes }) {
 function decodeProject(text) {
   const data = JSON.parse(text);
   if (data.format !== 'artframes') throw new Error('Це не проєкт ArtFrames');
-  const { frames, reference, ...meta } = data;
+  const { frames, reference, sketch, ...meta } = data;
   return {
     meta,
     reference: reference && { ...reference, data: reference.data ? Buffer.from(reference.data, 'base64') : null },
+    sketch: sketch?.png ? { ...sketch, png: Buffer.from(sketch.png, 'base64') } : null,
     frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png, 'base64') : null })),
   };
 }

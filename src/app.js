@@ -82,6 +82,7 @@ let doc = null; // { width, height, fps, paper, frames, file, name }
 let ticks = [0]; // start tick of every frame, plus the total at the end
 let cur = 0;
 let ref = null; // image reference object or a VideoRef, both with { kind, file, name, opacity, visible, layer, rect }
+let editSketch = false; // the brush draws the own reference (doc.sketch) instead of the current frame
 let dirty = false;
 let editRev = 0;
 let autosavedRev = 0;
@@ -95,6 +96,12 @@ const rgba = hex => [...rgb(hex), 1];
 
 function makeFrame(hold = 1) {
   return { id: nextId++, hold, layer: null, thumb: null, rev: 0, saved: null };
+}
+
+// The own reference: one drawing under every frame (calligraphy to animate over, a path, a layout). It is drawn,
+// undone and saved like a frame, but it is not on the timeline.
+function makeSketch() {
+  return { ...makeFrame(), visible: true, opacity: 0.5 };
 }
 
 function ensureLayer(f) {
@@ -122,7 +129,7 @@ function frameAtTick(t) {
 
 // GPU memory is not garbage-collected: a replaced document gives back its drawings and its undo history.
 function releaseDoc(old, keep) {
-  const frames = new Set(old.frames);
+  const frames = new Set([...old.frames, old.sketch]);
   for (const e of [...undoStack, ...redoStack]) {
     if (e.type === 'pixels') {
       gpu.free(e.data);
@@ -138,12 +145,14 @@ function releaseDoc(old, keep) {
   }
 }
 
-function setDoc({ width, height, fps, paper = '#ffffff', frames = null, file = null }) {
+function setDoc({ width, height, fps, paper = '#ffffff', frames = null, sketch = null, file = null }) {
   stopPlayback();
   removeReference(true);
   const fresh = frames || [makeFrame(prefs.step)];
-  if (doc) releaseDoc(doc, new Set(fresh));
-  doc = { width, height, fps, paper, frames: fresh, file, name: file ? basename(file) : 'Без назви' };
+  const own = sketch || makeSketch();
+  if (doc) releaseDoc(doc, new Set([...fresh, own]));
+  doc = { width, height, fps, paper, frames: fresh, sketch: own, file, name: file ? basename(file) : 'Без назви' };
+  editSketch = false;
   undoStack.length = 0;
   redoStack.length = 0;
   sheet.style.width = `${width}px`;
@@ -164,7 +173,7 @@ function setDoc({ width, height, fps, paper = '#ffffff', frames = null, file = n
 }
 
 function pristine() {
-  return doc.frames.every(f => !f.layer);
+  return doc.frames.every(f => !f.layer) && !doc.sketch.layer;
 }
 
 // ---------- view: zoom, pan, mirror ----------
@@ -232,13 +241,19 @@ function refSub() {
   return [r.x / doc.width, r.y / doc.height, r.w / doc.width, r.h / doc.height];
 }
 
-// Back to front: paper, reference, onion ghosts (the far ones first), the drawing with the stroke in progress.
-function sceneOps({ paper = true, reference = true, ghosts = true, drawing = true, refOpacity = null } = {}) {
+const maskFor = f => (stroke?.frame === f ? { color: rgba(stroke.color), erase: stroke.erase } : null);
+
+// Back to front: paper, reference, own reference, onion ghosts (the far ones first), the drawing with the stroke in
+// progress. While the own reference is being drawn it comes forward at full strength and the animation steps back.
+function sceneOps({ paper = true, reference = true, sketch = true, ghosts = true, drawing = true, refOpacity = null } = {}) {
   const ops = [];
+  const editing = editSketch && !playing;
   if (paper) ops.push({ color: rgba(doc.paper) });
   if (reference && ref?.visible && ref.layer) ops.push({ layer: ref.layer, sub: refSub(), opacity: refOpacity ?? ref.opacity });
+  const sk = doc.sketch;
+  if (sketch && sk.layer && (sk.visible || editing)) ops.push({ layer: sk.layer, opacity: editing ? 1 : sk.opacity, mask: maskFor(sk) });
   const o = prefs.onion;
-  if (ghosts && o.on && !playing) {
+  if (ghosts && o.on && !playing && !editing) {
     // A light table: red behind, green ahead, fading with distance.
     const ghost = (i, color, k) => {
       const f = doc.frames[i];
@@ -248,9 +263,7 @@ function sceneOps({ paper = true, reference = true, ghosts = true, drawing = tru
     for (let k = o.next; k >= 1; k--) ghost(cur + k, o.nextColor, k);
   }
   const f = doc.frames[cur];
-  if (drawing && f.layer) {
-    ops.push({ layer: f.layer, mask: stroke?.frame === f ? { color: rgba(stroke.color), erase: stroke.erase } : null });
-  }
+  if (drawing && f.layer) ops.push({ layer: f.layer, opacity: editing ? 0.35 : 1, mask: maskFor(f) });
   return ops;
 }
 
@@ -287,7 +300,7 @@ async function contextRestored() {
   undoStack.length = 0;
   redoStack.length = 0;
   let lost = 0;
-  for (const f of doc.frames) {
+  for (const f of [...doc.frames, doc.sketch]) {
     const had = f.rev > 0 || !!f.layer;
     f.layer = null;
     if (f.saved) await uploadPng(f, f.saved.png, doc.width, doc.height);
@@ -375,6 +388,7 @@ function markCells(scroll) {
 const thumbQueue = new Set();
 let thumbTimer = 0;
 function scheduleThumb(f) {
+  if (f === doc.sketch) return; // not on the timeline
   thumbQueue.add(f);
   clearTimeout(thumbTimer);
   thumbTimer = setTimeout(flushThumbs, 150);
@@ -471,6 +485,11 @@ function swapPixels(e) {
   e.data = now;
   e.frame.rev++;
   scheduleThumb(e.frame);
+  if (e.frame === doc.sketch) {
+    doc.sketch.visible = true; // never change what cannot be seen
+    showSketch();
+    requestRender();
+  }
   const i = doc.frames.indexOf(e.frame);
   if (i >= 0) showFrame(i);
 }
@@ -568,8 +587,10 @@ function changeHold(d) {
   if (hold !== f.hold) structural(() => { f.hold = hold; });
 }
 
-function clearFrame() {
-  const f = doc.frames[cur];
+// What the brush, Delete and the eyedropper's colour go to: the current frame, or the own reference.
+const target = () => (editSketch ? doc.sketch : doc.frames[cur]);
+
+function clearFrame(f = target()) {
   if (!f.layer) return;
   const r = { x: 0, y: 0, w: doc.width, h: doc.height };
   const data = gpu.copyOut(f.layer, r);
@@ -577,7 +598,42 @@ function clearFrame() {
   f.rev++;
   pushUndo({ type: 'pixels', frame: f, r, data });
   scheduleThumb(f);
+  if (f === doc.sketch) showSketch();
   showFrame(cur);
+}
+
+// Adds one drawing to another on the GPU, over it or under it (the own reference always goes under the frame,
+// as it is shown); undo keeps the whole target.
+function mergeInto(dst, src, under) {
+  if (!src.layer) return false;
+  const r = { x: 0, y: 0, w: doc.width, h: doc.height };
+  ensureLayer(dst);
+  const data = gpu.copyOut(dst.layer, r);
+  const tmp = gpu.layer(doc.width, doc.height, { mips: false });
+  const ops = [{ layer: dst.layer }, { layer: src.layer }];
+  gpu.draw(tmp, r, doc.width, under ? ops.reverse() : ops);
+  gpu.blit(tmp, dst.layer, r, r);
+  gpu.free(tmp);
+  dst.rev++;
+  pushUndo({ type: 'pixels', frame: dst, r, data });
+  scheduleThumb(dst);
+  return true;
+}
+
+function frameToSketch() {
+  stopPlayback();
+  if (!mergeInto(doc.sketch, doc.frames[cur], false)) return toast('У кадрі нічого не намальовано');
+  doc.sketch.visible = true;
+  showSketch();
+  requestRender();
+  toast(`Малюнок кадру ${cur + 1} додано у свій референс`);
+}
+
+function sketchToFrame() {
+  stopPlayback();
+  if (!mergeInto(doc.frames[cur], doc.sketch, true)) return toast('Свій референс поки порожній');
+  showFrame(cur);
+  toast(`Свій референс додано в кадр ${cur + 1}`);
 }
 
 function go(i) {
@@ -606,7 +662,7 @@ function feed(e) {
 
 function startStroke(e) {
   stopPlayback();
-  const f = doc.frames[cur];
+  const f = target();
   ensureLayer(f);
   gpu.beginStroke(doc.width, doc.height);
   const kind = e.button === 5 || e.buttons & 32 ? 'eraser' : prefs.tool;
@@ -642,6 +698,7 @@ function endStroke() {
     frame.rev++;
     pushUndo({ type: 'pixels', frame, r, data });
     scheduleThumb(frame);
+    if (frame === doc.sketch) showSketch();
   }
   requestRender();
 }
@@ -894,6 +951,42 @@ async function pickReference() {
   if (file) await guarded(() => loadReference(file));
 }
 
+// ---------- own reference ----------
+
+function setEditSketch(v = !editSketch) {
+  if (stroke || v === editSketch) return;
+  stopPlayback();
+  editSketch = v;
+  if (v && !doc.sketch.visible) {
+    doc.sketch.visible = true;
+    changed();
+  }
+  showSketch();
+  requestRender();
+}
+
+function toggleSketch(v = !doc.sketch.visible) {
+  if (editSketch && !v) setEditSketch(false); // hidden means not being drawn
+  doc.sketch.visible = v;
+  showSketch();
+  requestRender();
+  changed();
+}
+
+function showSketch() {
+  const sk = doc.sketch;
+  document.body.classList.toggle('sketching', editSketch);
+  $$('#target button').forEach(b => b.classList.toggle('on', (b.dataset.target === 'sketch') === editSketch));
+  $('#sketchMode').classList.toggle('on', editSketch);
+  $('#sketchMode').textContent = editSketch ? 'Готово, назад до кадрів' : 'Малювати свій референс';
+  $('#sketchHint').hidden = !!sk.layer;
+  $('#sketchVisible').checked = sk.visible;
+  $('#sketchOpacity').value = Math.round(sk.opacity * 100);
+  $('#sketchOpacityOut').textContent = `${Math.round(sk.opacity * 100)}%`;
+  $('#sketchToFrame').disabled = !sk.layer;
+  $('#sketchClear').disabled = !sk.layer;
+}
+
 // ---------- playback ----------
 
 let playing = null;
@@ -1021,10 +1114,13 @@ async function serialize() {
     offset: ref.offset || 0,
     sound: ref.sound,
   };
+  const sk = doc.sketch;
+  if (sk.layer && sk.saved?.rev !== sk.rev) sk.saved = { rev: sk.rev, png: await pngBytes(sk.layer) };
   return {
     meta: { width: doc.width, height: doc.height, fps: doc.fps, paper: doc.paper, cur, reference },
     frames,
     refBytes: ref?.kind === 'image' ? ref.bytes : null,
+    sketch: sk.layer ? { visible: sk.visible, opacity: sk.opacity, png: sk.saved.png } : null,
   };
 }
 
@@ -1039,7 +1135,12 @@ async function applyProject(project, file) {
     }
     frames.push(f);
   }
-  setDoc({ width: meta.width, height: meta.height, fps: meta.fps, paper: meta.paper, frames, file });
+  const sketch = makeSketch();
+  if (project.sketch) {
+    await uploadPng(sketch, project.sketch.png, meta.width, meta.height);
+    Object.assign(sketch, { visible: project.sketch.visible ?? true, opacity: project.sketch.opacity ?? 0.5, saved: { rev: 0, png: project.sketch.png } });
+  }
+  setDoc({ width: meta.width, height: meta.height, fps: meta.fps, paper: meta.paper, frames, sketch, file });
   if (reference) {
     const o = { ...reference, adopt: false, quiet: true, bytes: reference.data };
     try {
@@ -1129,6 +1230,7 @@ async function exportDialog() {
     kind: prefs.exportKind || 'gif',
     scale: prefs.exportScale || 1,
     withRef: video ? true : false,
+    withSketch: false,
     transparent: false,
     audio: true,
   };
@@ -1146,10 +1248,12 @@ async function exportDialog() {
         <button data-v="1">100%<small> ${doc.width}×${doc.height}</small></button><button data-v="0.5">50%</button><button data-v="0.25">25%</button>
       </div></div>
       ${ref ? `<label class="row toggle"><span>Підкласти референс</span><input type="checkbox" data-t="withRef"></label>` : ''}
+      ${doc.sketch.layer ? `<label class="row toggle"><span>Підкласти свій референс</span><input type="checkbox" data-t="withSketch"></label>` : ''}
       ${overVideo && vid && ref.hasAudio ? `<label class="row toggle"><span>Звук із відео</span><input type="checkbox" data-t="audio"></label>` : ''}
       ${st.kind === 'png' && !st.withRef ? `<label class="row toggle"><span>Прозорий фон</span><input type="checkbox" data-t="transparent"></label>` : ''}
       <p class="hint" style="margin-top:10px">${len} · ${fmtFps(overVideo && vid ? ref.fps : doc.fps)} к/с${overVideo && vid ? ' (частота відео)' : ''}${st.kind === 'png' ? ` · ${n} PNG` : ''}.
       ${overVideo ? 'Відео піде під малюнок на повну яскравість.' : ''}
+      ${st.withSketch ? 'Свій референс ляже під кожен кадр на повну яскравість.' : ''}
       ${st.kind === 'gif' && st.scale === 1 && doc.width > 1000 ? 'Для GIF краще 50%: файл буде вчетверо легший.' : ''}</p>`;
     body.querySelectorAll('.choices').forEach(group => {
       const k = group.dataset.k;
@@ -1187,7 +1291,7 @@ async function exportDialog() {
 }
 
 // The exporter asks for finished pictures: paper, the reference (the picture, or a video frame it decoded itself),
-// the drawing, composited on the GPU at the export size and read back as RGBA rows.
+// the own reference if asked for, the drawing, composited on the GPU at the export size and read back as RGBA rows.
 function exportSource() {
   return {
     width: doc.width,
@@ -1199,7 +1303,7 @@ function exportSource() {
     video: ref?.kind === 'video' ? ref : null,
     image: ref?.kind === 'image',
     unpremultiply,
-    render(W, H, { frame, under = null, image = false, paper = true }) {
+    render(W, H, { frame, under = null, image = false, paper = true, sketch = false }) {
       const ops = [];
       if (paper) ops.push({ color: rgba(doc.paper) });
       if (image && ref?.kind === 'image') ops.push({ layer: ref.layer, sub: refSub() });
@@ -1208,6 +1312,7 @@ function exportSource() {
         gpu.upload(u, under);
         ops.push({ layer: u, sub: refSub() });
       }
+      if (sketch && doc.sketch.layer) ops.push({ layer: doc.sketch.layer });
       if (frame?.layer) ops.push({ layer: frame.layer });
       return renderDoc('export', W, H, ops, { fit: true });
     },
@@ -1343,13 +1448,14 @@ const KEYS = [
   ['1 – 6', 'кольори палітри · Alt+клік — піпетка'],
   ['N', 'новий порожній кадр після поточного'],
   ['D', 'дублювати кадр'],
-  ['Delete', 'очистити кадр · Shift+Delete — видалити кадр'],
+  ['Tab', 'малювати свій референс / назад до кадрів'],
+  ['Delete', 'очистити кадр (у режимі референсу — референс) · Shift+Delete — видалити кадр'],
   ['← →  , .', 'попередній / наступний кадр · Home / End'],
   ['Alt+← →', 'пересунути кадр по таймлайну'],
   ['− =', 'утримання кадру: коротше / довше'],
   ['Пробіл', 'грати / пауза · затиснути й тягнути — рух полотна'],
   ['O', 'калька (onion skin)'],
-  ['R', 'показати / сховати референс · Ctrl+I — завантажити'],
+  ['R', 'показати / сховати референс · Shift+R — свій референс · Ctrl+I — завантажити'],
   ['M', 'віддзеркалити полотно'],
   ['Колесо', 'масштаб · 0 — вмістити · середня кнопка — рух'],
   ['Ctrl+Z', 'скасувати · Ctrl+Shift+Z / Ctrl+Y — повторити'],
@@ -1433,6 +1539,7 @@ function refreshUI() {
       $('#refMeta').textContent = `Картинка ${ref.width}×${ref.height}`;
     }
   }
+  showSketch();
   $('#undoBtn').disabled = !undoStack.length;
   $('#redoBtn').disabled = !redoStack.length;
   updateInfo();
@@ -1453,6 +1560,7 @@ function wire() {
   buildPalette();
   const on = (sel, ev, fn) => $(sel).addEventListener(ev, fn);
   $$('#tools button').forEach(b => { b.onclick = () => setTool(b.dataset.tool); });
+  $$('#target button').forEach(b => { b.onclick = () => setEditSketch(b.dataset.target === 'sketch'); });
   on('#sizeRange', 'input', e => setSize(rangeToSize(+e.target.value)));
   on('#sizeNum', 'change', e => setSize(+e.target.value || 1));
   on('#colorPick', 'input', e => setColor(e.target.value));
@@ -1530,6 +1638,17 @@ function wire() {
     changed();
   });
   on('#refFill', 'click', fillToVideo);
+  on('#sketchMode', 'click', () => setEditSketch());
+  on('#sketchVisible', 'change', e => toggleSketch(e.target.checked));
+  on('#sketchOpacity', 'input', e => {
+    doc.sketch.opacity = +e.target.value / 100;
+    $('#sketchOpacityOut').textContent = `${e.target.value}%`;
+    requestRender();
+    changed();
+  });
+  on('#frameToSketch', 'click', frameToSketch);
+  on('#sketchToFrame', 'click', sketchToFrame);
+  on('#sketchClear', 'click', () => clearFrame(doc.sketch));
   on('#paperColor', 'input', e => {
     doc.paper = e.target.value;
     requestRender();
@@ -1692,7 +1811,9 @@ addEventListener('keydown', e => {
   else if (k === 'Minus' || k === 'NumpadSubtract') changeHold(-1);
   else if (k === 'Equal' || k === 'NumpadAdd') changeHold(1);
   else if (k === 'KeyO') toggleOnion();
-  else if (k === 'KeyR') toggleRef();
+  else if (k === 'Tab') setEditSketch();
+  else if (k === 'Escape' && editSketch) setEditSketch(false);
+  else if (k === 'KeyR') e.shiftKey ? toggleSketch() : toggleRef();
   else if (k === 'KeyM') toggleMirror();
   else if (k === 'Digit0' || k === 'Numpad0') fit();
   else if (k === 'Enter' || k === 'NumpadEnter') togglePlay();
@@ -1750,6 +1871,8 @@ window.__af = {
   get prefs() { return prefs; },
   get playing() { return !!playing; },
   get undoDepth() { return undoStack.length; },
+  get editSketch() { return editSketch; },
+  get sketch() { return { visible: doc.sketch.visible, opacity: doc.sketch.opacity, drawn: !!doc.sketch.layer }; },
   get view() { return view; },
   perf,
   setDoc,
@@ -1759,14 +1882,20 @@ window.__af = {
   save: async file => af.saveProject(file, await serialize()),
   open: async file => applyProject(await af.loadProject(file), file),
   gpu,
-  // Premultiplied RGBA of one drawing, or of one layer of the scene ('onion', 'ref') at 1:1.
+  // Premultiplied RGBA of one drawing, or of a part of the scene at 1:1: 'onion', 'ref', 'sketch' (the own
+  // reference as drawn) or 'scene' (what the sheet shows, without ghosts).
   readFrame: i => {
     const f = doc.frames[i];
     return f?.layer ? gpu.read(f.layer) : null;
   },
   readLayer: (name, x = 0, y = 0, w = doc.width, h = doc.height) => {
-    const only = name === 'onion' ? { paper: false, reference: false, drawing: false } : { paper: false, ghosts: false, drawing: false, refOpacity: 1 };
-    return renderDoc('probe', w, h, sceneOps(only), { x, y });
+    const only = {
+      onion: { paper: false, reference: false, sketch: false, drawing: false },
+      ref: { paper: false, sketch: false, ghosts: false, drawing: false, refOpacity: 1 },
+      scene: { ghosts: false },
+    }[name];
+    const ops = name === 'sketch' ? (doc.sketch.layer ? [{ layer: doc.sketch.layer }] : []) : sceneOps(only);
+    return renderDoc('probe', w, h, ops, { x, y });
   },
   setTool,
   setSize,
