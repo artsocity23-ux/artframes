@@ -230,9 +230,12 @@ let renderQueued = false;
 // Drawing cost, read by the self-test: input batches (CPU) and full redraws of the sheet.
 const perf = { moves: 0, ms: 0, max: 0, renders: 0, renderMs: 0, renderMax: 0 };
 
+let renderAsked = 0;
+
 function requestRender() {
   if (renderQueued) return;
   renderQueued = true;
+  renderAsked = performance.now();
   requestAnimationFrame(render);
 }
 
@@ -271,6 +274,7 @@ function render() {
   renderQueued = false;
   if (!doc || gpu.lost) return;
   const t = performance.now();
+  if (t - renderAsked > 300) stall(`frame came ${Math.round(t - renderAsked)} ms after it was asked for`);
   const d = dpr();
   const w = Math.round(stage.clientWidth * d);
   const h = Math.round(stage.clientHeight * d);
@@ -758,13 +762,20 @@ const endPointer = e => {
 stage.addEventListener('pointerup', endPointer);
 stage.addEventListener('pointercancel', endPointer);
 stage.addEventListener('lostpointercapture', endPointer); // capture gone without a pointerup: nothing may stay stuck
-// The brush ring follows whichever pointer last moved over the stage, and hides only when that one leaves. A tablet
-// driver may move a mouse pointer alongside the pen; its leave must not take the pen's ring away.
+// The brush ring follows whichever pointer last moved over the stage, and hides only when that one really goes off
+// the stage. A tablet driver may move a mouse pointer alongside the pen; its leave must not take the pen's ring
+// away. And a pen that drops out of range (a light touch, a pause; old tablets do it often) "leaves" from a spot
+// over the sheet, sometimes with bogus coordinates: like the system cursor, the ring then stays where the pen was.
 stage.addEventListener('pointerleave', e => {
   remember(e);
-  if (e.pointerId === hoverId) flag('out', true, why(e));
+  if (e.pointerId !== hoverId) return;
+  // What is really at that spot now: the sheet (the pen just went out of range), or a dialog, a panel, nothing.
+  const over = stage.contains(document.elementFromPoint(e.clientX, e.clientY));
+  if (over) af.log(`cursor: out kept (${why(e)} at ${Math.round(e.clientX)},${Math.round(e.clientY)}, still over the stage)`);
+  else flag('out', true, why(e));
 });
 stage.addEventListener('pointerenter', remember);
+stage.addEventListener('pointerover', moveCursor); // a pointer coming back shows the ring before it even moves
 stage.addEventListener('contextmenu', e => e.preventDefault());
 
 stage.addEventListener('wheel', e => {
@@ -822,6 +833,30 @@ for (const type of ['pointerdown', 'pointerup', 'pointermove', 'pointercancel', 
 }
 document.addEventListener('visibilitychange', () => remember({ type: `visibility-${document.visibilityState}` }));
 
+// Raw pointer updates arrive as soon as the OS hands them over, not once per frame like pointermove; counting them
+// shows whether the pen still talks to the app while the moves (and frames) have stopped.
+const raw = { n: 0, t: 0, pt: null, id: null, x: 0, y: 0 };
+addEventListener('pointerrawupdate', e => {
+  Object.assign(raw, { n: raw.n + 1, t: Math.round(performance.now()), pt: e.pointerType, id: e.pointerId, x: Math.round(e.clientX), y: Math.round(e.clientY) });
+}, { passive: true });
+
+// Stalls: the main thread (a timer firing late) or a frame that was asked for and came late. Some pen setups make
+// an app freeze until the mouse moves; these lines tell that apart from the cursor logic.
+let lastStall = 0;
+function stall(what) {
+  const now = performance.now();
+  if (now - lastStall < 3000 || document.visibilityState !== 'visible') return;
+  lastStall = now;
+  const last = trail[trail.length - 1];
+  af.log(`cursor: stall, ${what}; last event ${last ? `${last.ev} ${last.pt || last.key || ''}#${last.id ?? ''} ${Math.round(now - last.t)} ms ago` : '-'}; raw updates ${raw.n}, last ${raw.t ? Math.round(now - raw.t) : '-'} ms ago`);
+}
+let beat = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  if (now - beat > 900) stall(`main thread was busy ${Math.round(now - beat - 500)} ms`);
+  beat = now;
+}, 500);
+
 function cursorSnapshot() {
   const c = getComputedStyle(cursorEl);
   const ring = cursorEl.firstElementChild.getBoundingClientRect();
@@ -834,7 +869,7 @@ function cursorSnapshot() {
     focus: document.hasFocus(), visibility: document.visibilityState, active: describe(document.activeElement), modal: $('#modal').childElementCount > 0,
     under: last ? describe(document.elementFromPoint(last.x, last.y)) : '-',
     tool: prefs.tool, size: prefs.sizes[prefs.tool], zoom: +view.zoom.toFixed(3), dpr: dpr(), editSketch, playing: !!playing,
-    now: Math.round(performance.now()), trail,
+    now: Math.round(performance.now()), raw: { ...raw }, trail,
   };
   af.log(`cursor snapshot ${JSON.stringify(s)}`);
 }

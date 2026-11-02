@@ -657,6 +657,16 @@ module.exports = async function selftest({ win, out }) {
   // The safety net: a system cross is always set over the stage; with Space stuck down the ring stays (dimmed);
   // F9 logs a snapshot and puts everything back; every change of the cursor is in the log with its cause.
   const net = { cross: await js("getComputedStyle(document.getElementById('stage')).cursor") };
+  // A pen dropping out of range "leaves" from a spot over the sheet (CDP has no out-of-range, so this leave is
+  // dispatched by hand, the way Chromium sends it): the ring stays where the pen was.
+  await js("addEventListener('pointermove', e => { if (e.pointerType === 'pen') window.__penId = e.pointerId; }, true); true");
+  await hover(line(P, Q, 4));
+  await js(`document.getElementById('stage').dispatchEvent(new PointerEvent('pointerleave', { pointerId: __penId, pointerType: 'pen', clientX: ${Q[0]}, clientY: ${Q[1]} })); true`);
+  await wait(60);
+  net.outOfRange = await under(Q);
+  // A main thread blocked for a while shows up in the log as a stall.
+  await js('(() => { const t = performance.now(); while (performance.now() - t < 1200); return true; })()');
+  await wait(800);
   wc.sendInputEvent({ type: 'keyDown', keyCode: 'Space' }); // held, as if its key-up got lost
   await wait(80);
   await hover(line(Q, P, 4));
@@ -671,14 +681,18 @@ module.exports = async function selftest({ win, out }) {
   const snap = snapLine ? JSON.parse(snapLine.slice(snapLine.indexOf('{'))) : null;
   net.log = {
     hiddenWithCause: /cursor: out on \(pointerleave pen#\d+/.test(logText),
-    shownWithCause: /cursor: out off \(pointermove pen#\d+/.test(logText),
+    shownWithCause: /cursor: out off \(pointer(over|move) pen#\d+/.test(logText),
     spaceLogged: /cursor: space on \(Space down\)/.test(logText) && /cursor: space off \(F9\)/.test(logText),
-    snapshot: snap && { stage: snap.stage, focus: snap.focus, ring: snap.ring, trail: snap.trail.length, last: snap.trail[snap.trail.length - 1] },
+    keptLogged: /cursor: out kept \(pointerleave pen#\d+/.test(logText),
+    stallLogged: /cursor: stall, main thread was busy \d+ ms/.test(logText),
+    snapshot: snap && { stage: snap.stage, focus: snap.focus, ring: snap.ring, raw: snap.raw, trail: snap.trail.length, last: snap.trail[snap.trail.length - 1] },
   };
   check('cursor safety net: system cross, F9, log',
     /^image-set\(|^url\(/.test(net.cross) && net.spaceHeld.shown && net.spaceHeld.off < 3 && /space/.test(net.spaceHeld.stage) &&
+      net.outOfRange.shown && net.outOfRange.off < 3 &&
       !/space|out|panning/.test(net.afterF9.stage) && /журнал/.test(net.afterF9.toast) &&
-      net.log.hiddenWithCause && net.log.shownWithCause && net.log.spaceLogged && !!snap && /space/.test(snap.stage) && snap.trail.length >= 10,
+      net.log.hiddenWithCause && net.log.shownWithCause && net.log.spaceLogged && net.log.keptLogged && net.log.stallLogged &&
+      !!snap && /space/.test(snap.stage) && snap.trail.length >= 10 && snap.raw.n > 0,
     { ...net, cross: net.cross.slice(0, 40) });
   await js(`__af.open(${JSON.stringify(project)})`);
 
