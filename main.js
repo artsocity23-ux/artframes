@@ -6,12 +6,14 @@ const qrcode = require('qrcode-generator');
 
 const ROOT = __dirname;
 const BENCH = process.argv.includes('--bench');
-const SELFTEST = process.argv.includes('--selftest') || BENCH;
+const DEMO = process.argv.includes('--demo');
+// The self-test, the benchmark and the README demo recording drive the app themselves: default prefs, no dialogs.
+const SELFTEST = process.argv.includes('--selftest') || BENCH || DEMO;
 const IS_MAC = process.platform === 'darwin';
 // An installed build keeps the log and the autosave in the per-user app data folder, a source checkout beside the code.
 const DATA = app.isPackaged ? app.getPath('userData') : ROOT;
 const LOG = path.join(DATA, 'artframes.log');
-const testArg = process.argv.indexOf(BENCH ? '--bench' : '--selftest');
+const testArg = process.argv.indexOf(BENCH ? '--bench' : DEMO ? '--demo' : '--selftest');
 const OUT = SELFTEST ? path.resolve(process.argv[testArg + 1] || 'selftest-out') : null;
 const AUTOSAVE = SELFTEST ? path.join(OUT, 'autosave.artframes') : path.join(DATA, 'autosave.artframes');
 
@@ -335,7 +337,7 @@ app.whenReady().then(() => {
   createWindow();
   log(`start ${app.getVersion()}`);
   if (SELFTEST) {
-    require(BENCH ? './bench' : './selftest')({ win, out: OUT }).catch(err => {
+    require(BENCH ? './bench' : DEMO ? './demo' : './selftest')({ win, out: OUT }).catch(err => {
       console.error(err);
       app.exit(1);
     });

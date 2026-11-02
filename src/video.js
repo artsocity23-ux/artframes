@@ -140,6 +140,10 @@ export class VideoRef {
   async play(fromTick, clock) {
     const gen = ++this.playGen;
     this.shownTick = null;
+    // The decoder needs a moment to seek; a cached first frame goes up at once instead of the last one lingering
+    // (most visible when a short clip loops back to its start).
+    const cached = this.cache.get(fromTick);
+    if (cached) this.onFrame(cached);
     const base = this.first + this.offset / this.fps;
     try {
       for await (const wc of this.playSink.canvases(this.time(fromTick))) {

@@ -17,7 +17,8 @@
     "selftest": "electron . --selftest selftest-out",
     "icon": "node make-icon.js",
     "dist": "electron-builder --publish never",
-    "bench": "electron . --bench bench-out"
+    "bench": "electron . --bench bench-out",
+    "demo": "electron . --demo demo-out"
   },
   "dependencies": {
     "gifenc": "^1.0.3",
@@ -42,6 +43,7 @@
       "preload.js",
       "selftest.js",
       "bench.js",
+      "demo.js",
       "index.html",
       "app.css",
       "src/**",

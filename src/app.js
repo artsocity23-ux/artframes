@@ -1007,6 +1007,7 @@ function play() {
 function startVideo(from) {
   if (ref?.kind !== 'video') return;
   if (ref.visible) ref.play(from, clock);
+  if (from !== 0 && prefs.loop) ref.prefetch([0]); // ready for the loop back to the start
   if (ref.sound && ref.hasAudio && audio.src) {
     audio.currentTime = Math.max(0, ref.localTime(from));
     audio.play().catch(() => {});
@@ -1769,7 +1770,10 @@ addEventListener('keydown', e => {
     if (e.key === 'Escape' || e.key === 'Enter') e.target.blur();
     return;
   }
-  if (!doc || stroke) return;
+  if (!doc || stroke) {
+    if (e.code === 'Tab') e.preventDefault(); // mid-stroke: ignored, and the focus stays put
+    return;
+  }
   const k = e.code;
   const ctrl = e.ctrlKey || e.metaKey;
   let handled = true;
