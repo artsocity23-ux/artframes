@@ -1,7 +1,7 @@
 {
   "name": "artframes",
   "productName": "ArtFrames",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Light frame-by-frame animation: onion skin, round and flat brushes, drawing over a video or picture, GIF/MP4/PNG export.",
   "author": {
