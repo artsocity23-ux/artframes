@@ -993,6 +993,45 @@ module.exports = async function selftest({ win, out }) {
       vl);
   }
 
+  // ---------- 14. the example in the repository opens ----------
+  // A real animation drawn in ArtFrames (a liquid splash: 58 drawings on twos over trajectories on the hidden own
+  // reference). Only in a source checkout: the installers do not carry examples/.
+  const example = path.join(__dirname, 'examples', 'liquid-splash.artframes');
+  if (fs.existsSync(example)) {
+    await js(`__af.open(${JSON.stringify(example)})`);
+    await wait(300);
+    const ex = await js(`({ w: __af.doc.width, h: __af.doc.height, fps: __af.doc.fps, frames: __af.doc.frames.length,
+      holds: [...new Set(__af.doc.frames.map(f => f.hold))], ink: __af.doc.frames.map((f, i) => __t.ink(i)),
+      sketch: { ...__af.sketch, ink: __t.sketchInk() }, refs: __af.refs.length })`);
+    // The same count straight from the PNGs in the file: every drawing must arrive whole (the first and last drops
+    // are only a few pixels).
+    const fileInk = await js(`(async () => {
+      const j = JSON.parse(new TextDecoder().decode(await af.read(${JSON.stringify(example)})));
+      const c = document.createElement('canvas');
+      c.width = j.width;
+      c.height = j.height;
+      const g = c.getContext('2d', { willReadFrequently: true });
+      const out = [];
+      for (const f of j.frames) {
+        const bmp = await createImageBitmap(new Blob([Uint8Array.from(atob(f.png), ch => ch.charCodeAt(0))], { type: 'image/png' }));
+        g.clearRect(0, 0, c.width, c.height);
+        g.drawImage(bmp, 0, 0);
+        const d = g.getImageData(0, 0, c.width, c.height).data;
+        let n = 0;
+        for (let k = 3; k < d.length; k += 4) if (d[k] > 127) n++;
+        out.push(n);
+      }
+      return out;
+    })()`);
+    ex.fileInk = fileInk;
+    check('example project opens: liquid splash',
+      ex.w === 1080 && ex.h === 1080 && ex.fps === 24 && ex.frames === 58 && ex.holds.join() === '2' &&
+        ex.ink.every(n => n > 0) && Math.max(...ex.ink) > 10000 && ex.ink.every((n, i) => Math.abs(n - fileInk[i]) <= Math.max(2, fileInk[i] * 0.005)) &&
+        ex.sketch.drawn && !ex.sketch.visible && ex.sketch.ink > 1000 && ex.refs === 0,
+      ex);
+    await js(`__af.open(${JSON.stringify(project)})`);
+  }
+
   // Donate window from donate.json.
   await js('af.openDonate(); true');
   let donateWin = null;
