@@ -195,16 +195,16 @@ ipcMain.handle('af:range-close', (e, file) => {
 
 // ---------- project files ----------
 // A project is one JSON file: settings plus every drawing as base64 PNG. Videos stay where they are (path only),
-// a reference picture is embedded so the project still opens on another computer. The own (drawn) reference is
-// one more PNG with its visibility and opacity; older files simply have none.
+// reference pictures are embedded so the project still opens on another computer. References are a list of layers,
+// bottom first, each with its corners on the sheet (quad); version 1 files had one reference without a quad. The own
+// (drawn) reference is one more PNG with its visibility and opacity; older files simply have none.
 
-function encodeProject({ meta, frames, refBytes, sketch }) {
-  const reference = meta.reference && { ...meta.reference, data: refBytes ? Buffer.from(refBytes).toString('base64') : null };
+function encodeProject({ meta, frames, refs, sketch }) {
   return JSON.stringify({
     format: 'artframes',
-    version: 1,
+    version: 2,
     ...meta,
-    reference,
+    references: (refs || []).map(({ data, ...r }) => ({ ...r, data: data ? Buffer.from(data).toString('base64') : null })),
     sketch: sketch && { ...sketch, png: Buffer.from(sketch.png).toString('base64') },
     frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png).toString('base64') : null })),
   });
@@ -213,10 +213,11 @@ function encodeProject({ meta, frames, refBytes, sketch }) {
 function decodeProject(text) {
   const data = JSON.parse(text);
   if (data.format !== 'artframes') throw new Error('Це не проєкт ArtFrames');
-  const { frames, reference, sketch, ...meta } = data;
+  const { frames, reference, references, sketch, ...meta } = data;
+  const list = references || (reference ? [reference] : []);
   return {
     meta,
-    reference: reference && { ...reference, data: reference.data ? Buffer.from(reference.data, 'base64') : null },
+    references: list.map(r => ({ ...r, data: r.data ? Buffer.from(r.data, 'base64') : null })),
     sketch: sketch?.png ? { ...sketch, png: Buffer.from(sketch.png, 'base64') } : null,
     frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png, 'base64') : null })),
   };

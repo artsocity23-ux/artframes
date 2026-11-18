@@ -24,17 +24,28 @@ void main() {
 const LAYER_FS = `#version 300 es
 precision highp float;
 in vec2 v_uv;
-uniform int u_mode;       // 0 solid colour, 1 texture, 2 drawing with the stroke in progress, 3 stroke mask alone
+uniform int u_mode;       // 0 solid colour, 1 texture, 2 drawing with the stroke in progress, 3 stroke mask alone,
+                          // 4 texture on any quad (a moved, scaled, rotated, mirrored or perspective reference)
 uniform vec4 u_color;     // premultiplied
 uniform sampler2D u_tex;
 uniform sampler2D u_mask;
 uniform vec4 u_sub;       // texture placement inside the document, in document uv
+uniform mat3 u_xf;        // mode 4: document uv -> texture uv, projective
 uniform float u_opacity;
 uniform vec4 u_tint;      // rgb, a = strength
 uniform bool u_erase;
 out vec4 o;
 void main() {
   if (u_mode == 0) { o = u_color; return; }
+  if (u_mode == 4) {
+    vec3 q = u_xf * vec3(v_uv, 1.0);
+    vec2 uv = q.xy / q.z;
+    // Distance to the quad's edge in target pixels: soft, anti-aliased edges at any angle.
+    vec2 e = min(uv, 1.0 - uv) / max(fwidth(uv), vec2(1e-6));
+    float cover = q.z > 0.0 ? clamp(min(e.x, e.y) + 0.5, 0.0, 1.0) : 0.0;
+    o = texture(u_tex, clamp(uv, 0.0, 1.0)) * (cover * u_opacity);
+    return;
+  }
   if (u_mode == 3) {
     float m = texture(u_mask, v_uv).r;
     o = u_erase ? vec4(0.0, 0.0, 0.0, m) : u_color * m;
@@ -325,7 +336,7 @@ export class GPU {
     let l = this.scratch.get(name);
     if (!l || l.w !== w || l.h !== h) {
       this.free(l);
-      l = this.layer(w, h, { mips: name === 'ref' || name === 'under' });
+      l = this.layer(w, h, { mips: name === 'ref' || name.startsWith('under') });
       this.scratch.set(name, l);
     }
     return l;
@@ -431,7 +442,9 @@ export class GPU {
   }
 
   // target: a layer, or null for the screen. place: where the document lands, in target pixels.
-  // ops, back to front: { color } | { layer, sub, opacity, tint, mask: { color, erase } }, docW: document width.
+  // ops, back to front: { color } | { layer, sub, opacity, tint, mask: { color, erase } }
+  //   | { layer, xf, px, opacity } (xf: column-major mat3 from document uv to texture uv, px: document pixels per
+  //   texel), docW: document width.
   draw(target, place, docW, ops) {
     const gl = this.gl;
     const tw = target ? target.w : this.canvas.width;
@@ -454,6 +467,12 @@ export class GPU {
       if (op.color) {
         gl.uniform1i(u.u_mode, 0);
         gl.uniform4fv(u.u_color, op.color);
+      } else if (op.xf) {
+        gl.activeTexture(gl.TEXTURE0);
+        this.prepare(op.layer, scale * op.px < 0.999);
+        gl.uniformMatrix3fv(u.u_xf, false, op.xf);
+        gl.uniform1f(u.u_opacity, op.opacity ?? 1);
+        gl.uniform1i(u.u_mode, 4);
       } else {
         const sub = op.sub || [0, 0, 1, 1];
         // Shown smaller than its own resolution: sample the mipmaps instead of skipping pixels.

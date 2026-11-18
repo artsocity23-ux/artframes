@@ -2,7 +2,7 @@
 // Draws a bouncing ball over several frames with real mouse input and a pen with pressure (Chrome DevTools input,
 // which arrives as PointerEvents of type "pen"), checks the onion skin, undo and frame operations, plays it back,
 // generates a test video with a frame counter and a tone, traces over it, draws an own reference under the frames,
-// and exports PNG, GIF, WebM and MP4.
+// lays pictures and videos as reference layers and transforms them with the pen, and exports PNG, GIF, WebM and MP4.
 // Writes report.json plus screenshots; exits 1 if any check fails.
 const { app, BrowserWindow } = require('electron');
 const { execFileSync } = require('child_process');
@@ -792,6 +792,205 @@ module.exports = async function selftest({ win, out }) {
         pasted.numberField.value === '30' && pasted.numberField.ref === 'video',
       pasted);
     await js(`__af.open(${JSON.stringify(project)})`);
+  }
+
+  // ---------- 13. reference layers and the transform frame ----------
+  // Pictures and videos lie as separate layers under the drawings. In transform mode (T) the pen moves, scales (in
+  // proportion; Shift: freely), turns on the knob, mirrors (H) and bends one corner in perspective (Ctrl); each move
+  // undoes; the panel reorders and hides layers; the project keeps it all and old one-reference files open as before;
+  // the video layers stay in sync when transformed, in the editor, in playback and in the export.
+  {
+    const DW = 1280;
+    const DH = 720;
+    const xf = {};
+    const writePng = (file, draw) => js(`(async () => {
+      const c = document.createElement('canvas');
+      ${draw}
+      const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+      await af.write(${JSON.stringify(file)}, new Uint8Array(await blob.arrayBuffer()));
+      return true;
+    })()`);
+    const layerA = path.join(out, 'layer-a.png');
+    const layerB = path.join(out, 'layer-b.png');
+    await writePng(layerA, "c.width = 800; c.height = 450; const g = c.getContext('2d'); g.fillStyle = '#e8c84a'; g.fillRect(0, 0, 800, 450);");
+    await writePng(layerB, "c.width = 400; c.height = 400; const g = c.getContext('2d'); g.fillStyle = '#2f5fd0'; g.fillRect(0, 0, 200, 400); g.fillStyle = '#d03a2f'; g.fillRect(200, 0, 200, 400);");
+    await js(`__af.setDoc({ width: ${DW}, height: ${DH}, fps: 24 })`);
+    for (let k = 0; k < 5; k++) await key('N');
+    await js(`__af.loadReference(${JSON.stringify(layerA)})`);
+    await js(`__af.loadReference(${JSON.stringify(layerB)})`);
+    await wait(200);
+    await measure();
+    const atDoc = (x, y) => at(x / DW, y / DH);
+    const quad = () => js('__af.ref.quad.map(p => p.map(v => Math.round(v * 10) / 10))');
+    const near = (q, want, tol = 3) => Array.isArray(q) && q.length === 4 && q.every((p, i) => Math.hypot(p[0] - want[i][0], p[1] - want[i][1]) <= tol);
+    const px = (x, y) => js(`__t.refPixel(${x}, ${y})`);
+    const colour = p => (p[3] === 0 ? 'none' : p[2] > p[0] + 60 ? 'blue' : p[0] > p[2] + 60 && p[1] < 120 ? 'red' : p[0] > 180 && p[1] > 150 && p[2] < 120 ? 'yellow' : 'other');
+    const colours = async () => [colour(await px(860, 260)), colour(await px(860, 540))];
+    const btn = sel => js(`(() => { const r = document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()`);
+    // A pen drag with keys held (CDP modifiers: 1 Alt, 2 Ctrl, 8 Shift), after a hover at its start.
+    const penDrag = async (pts, modifiers = 0) => {
+      const ev = (type, [x, y]) => cdp('Input.dispatchMouseEvent', { type, x, y, modifiers, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1, pointerType: 'pen', force: 0.5 });
+      await penAt(pts[0]);
+      await wait(30);
+      await ev('mousePressed', pts[0]);
+      for (const p of pts.slice(1)) {
+        await ev('mouseMoved', p);
+        await wait(6);
+      }
+      await ev('mouseReleased', pts[pts.length - 1]);
+      await wait(120);
+    };
+
+    await key('T');
+    xf.mode = await js(`({ on: __af.xform, badge: getComputedStyle(document.getElementById('xfBadge')).display,
+      handles: document.querySelectorAll('#xfFrame rect').length, selected: __af.ref.name })`);
+    // The bottom right corner to the middle of the sheet: half size, the top left corner stays.
+    await penDrag(line(atDoc(1000, 720), atDoc(640, 360), 16));
+    xf.scaled = await quad();
+    await penDrag(line(atDoc(460, 180), atDoc(760, 400), 16)); // drag inside: moves
+    xf.moved = await quad();
+    // A quarter turn clockwise on the knob above the frame (30 px over the middle of its top edge).
+    const C = atDoc(760, 400);
+    const M = atDoc(760, 220);
+    const R = Math.hypot(M[0] - C[0], M[1] - C[1]) + 30;
+    await penDrag(Array.from({ length: 25 }, (_, k) => {
+      const a = -Math.PI / 2 + (k / 24) * (Math.PI / 2);
+      return [C[0] + R * Math.cos(a), C[1] + R * Math.sin(a)];
+    }));
+    xf.rotated = await quad();
+    xf.rotColours = await colours();
+    await key('H');
+    xf.flipped = await quad();
+    xf.flipColours = await colours();
+    xf.beforeBend = colour(await px(530, 200));
+    await penDrag(line(atDoc(580, 220), atDoc(480, 160), 12), 2); // Ctrl: that corner alone, perspective
+    xf.bent = await quad();
+    xf.afterBend = colour(await px(530, 200));
+    await penAt(atDoc(700, 420));
+    await wait(200);
+    await shot('transform.png');
+    await key('Z', ['control']);
+    xf.undone = await quad();
+    await key('Y', ['control']);
+    xf.redone = await quad();
+    // A tap on the yellow picture outside the frame picks it; Shift stretches it freely.
+    await penDrag([atDoc(150, 600), atDoc(150, 600)]);
+    xf.picked = await js('__af.ref.name');
+    await penDrag(line(atDoc(1280, 720), atDoc(1280, 360), 12), 8);
+    xf.stretched = await quad();
+    await mouse([await btn('#xfBadge [data-xf=reset]')]);
+    xf.reset = await quad();
+    await key('Z', ['control']);
+    xf.unreset = await quad();
+    await key('Escape');
+    xf.off = await js("({ on: __af.xform, badge: getComputedStyle(document.getElementById('xfBadge')).display })");
+    check('reference transform with the pen: move, scale, rotate, mirror, perspective, undo',
+      xf.mode.on && xf.mode.badge === 'flex' && xf.mode.handles === 4 && xf.mode.selected === 'layer-b.png' &&
+        near(xf.scaled, [[280, 0], [640, 0], [640, 360], [280, 360]]) &&
+        near(xf.moved, [[580, 220], [940, 220], [940, 580], [580, 580]]) &&
+        near(xf.rotated, [[940, 220], [940, 580], [580, 580], [580, 220]], 4) && xf.rotColours.join() === 'blue,red' &&
+        near(xf.flipped, [[940, 580], [940, 220], [580, 220], [580, 580]], 4) && xf.flipColours.join() === 'red,blue' &&
+        near(xf.bent, [[940, 580], [940, 220], [480, 160], [580, 580]], 4) &&
+        [0, 1, 3].every(k => xf.bent[k].join() === xf.flipped[k].join()) &&
+        xf.beforeBend === 'yellow' && ['red', 'blue'].includes(xf.afterBend) &&
+        near(xf.undone, xf.flipped, 0.01) && near(xf.redone, xf.bent, 0.01) &&
+        xf.picked === 'layer-a.png' && near(xf.stretched, [[0, 0], [1280, 0], [1280, 360], [0, 360]]) &&
+        near(xf.reset, [[0, 0], [1280, 0], [1280, 720], [0, 720]], 0.01) && near(xf.unreset, xf.stretched, 0.01) &&
+        !xf.off.on && xf.off.badge === 'none',
+      xf);
+
+    // The panel: the blue-red picture one layer down (the yellow one is on top now), then the yellow one's eye off.
+    const ly = {};
+    await mouse([await btn('#refList .layer:nth-child(1) .mv[data-d="-1"]')]);
+    ly.order = await js('__af.refs.map(r => r.name)');
+    ly.orderColours = await colours();
+    await mouse([await btn('#refList .layer:nth-child(1) .eye')]);
+    ly.visible = await js('__af.refs.map(r => r.visible)');
+    ly.hiddenColours = await colours();
+    const layersFile = path.join(out, 'layers.artframes');
+    ly.saved = await js('__af.refs.map(r => ({ name: r.name, visible: r.visible, quad: r.quad }))');
+    await js(`__af.save(${JSON.stringify(layersFile)})`);
+    await js(`__af.open(${JSON.stringify(project)})`);
+    await js(`__af.open(${JSON.stringify(layersFile)})`);
+    ly.reopened = await js('__af.refs.map(r => ({ name: r.name, visible: r.visible, quad: r.quad }))');
+    ly.same = JSON.stringify(ly.reopened.map(r => [r.name, r.visible])) === JSON.stringify(ly.saved.map(r => [r.name, r.visible])) &&
+      ly.reopened.every((r, i) => near(r.quad, ly.saved[i].quad, 0.01));
+    // A project from before layers (version 1: one reference, no corners) opens as it always did.
+    const v2 = JSON.parse(fs.readFileSync(withPic, 'utf8'));
+    const v1 = { ...v2, version: 1, reference: { ...v2.references[0] } };
+    delete v1.references;
+    delete v1.refSel;
+    delete v1.reference.quad;
+    const oldFile = path.join(out, 'old-format.artframes');
+    fs.writeFileSync(oldFile, JSON.stringify(v1));
+    await js(`__af.open(${JSON.stringify(oldFile)})`);
+    ly.oldFormat = await js('({ n: __af.refs.length, kind: __af.ref && __af.ref.kind, quad: __af.ref && __af.ref.quad, centre: __t.refPixel(640, 360), side: __t.refPixel(100, 360) })');
+    check('reference layers: order, visibility, saved in the project, old files open',
+      ly.order.join() === 'layer-b.png,layer-a.png' && ly.orderColours.join() === 'yellow,blue' &&
+        ly.visible.join() === 'true,false' && ly.hiddenColours.join() === 'red,blue' && ly.same &&
+        ly.oldFormat.n === 1 && ly.oldFormat.kind === 'image' && near(ly.oldFormat.quad, [[280, 0], [1000, 0], [1000, 720], [280, 720]], 0.01) &&
+        green(ly.oldFormat.centre) && ly.oldFormat.side[3] === 0,
+      ly);
+
+    // Two copies of the test video on top: one at half size, one at a quarter in the corner.
+    const vl = {};
+    await js(`__af.open(${JSON.stringify(layersFile)})`);
+    await js(`__af.loadReference(${JSON.stringify(videoFile)})`);
+    await wait(300);
+    await measure();
+    await key('T');
+    await penDrag(line(atDoc(1280, 720), atDoc(640, 360), 16));
+    await penDrag(line(atDoc(320, 180), atDoc(620, 380), 16));
+    vl.first = await quad();
+    await key('Escape');
+    await js(`__af.loadReference(${JSON.stringify(videoFile)})`);
+    await wait(300);
+    await key('T');
+    await penDrag(line(atDoc(1280, 720), atDoc(320, 180), 16));
+    await penDrag(line(atDoc(160, 90), atDoc(1060, 620), 16));
+    vl.second = await quad();
+    await key('Escape');
+    vl.sound = await js('__af.refs.map(r => r.kind === "video" ? r.sound : null)');
+    // The grey square (level 5 x video frame) of each copy, stepping frames: drawing i starts at tick 2i.
+    vl.levels = [];
+    for (let i = 0; i < 6; i++) {
+      await js(`__af.go(${i})`);
+      for (let k = 0; k < 60; k++) {
+        if (await js('__af.refs.filter(r => r.kind === "video").every(v => v.shownTick === __af.cur * 2)')) break;
+        await wait(25);
+      }
+      vl.levels.push([(await px(324, 224))[0], (await px(912, 542))[0]]);
+    }
+    await js('__af.go(0)');
+    await wait(300);
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'Space' });
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'Space' });
+    vl.play = [];
+    for (let k = 0; k < 10; k++) {
+      await wait(60);
+      vl.play.push(await js(`({ tick: __af.doc.frames.slice(0, __af.cur).reduce((s, f) => s + f.hold, 0),
+        a: Math.round(__t.refPixel(324, 224)[0] / 5), b: Math.round(__t.refPixel(912, 542)[0] / 5) })`));
+    }
+    await key('Space');
+    const inStep = d => d >= -1 && d <= 3; // drawings change every 2 ticks: the video may lead by up to 2, plus timing
+    vl.inSync = vl.play.filter(p => inStep(p.a - p.tick) && inStep(p.b - p.tick)).length;
+    // Over-video MP4 at half size: both squares on their frame, the bent picture beside them, paper where nothing is.
+    const mp4x = path.join(out, 'layers-over-video.mp4');
+    await js(`__af.exportTo({ kind: 'mp4', target: ${JSON.stringify(mp4x)}, name: 'layers', scale: 0.5, withRef: true, audio: true })`);
+    vl.mp4 = await js(PROBE(mp4x, [['first', 2.5 / 24, 162, 112], ['second', 2.5 / 24, 456, 271], ['bent', 2.5 / 24, 250, 90], ['paper', 2.5 / 24, 50, 325]]));
+    const gifx = path.join(out, 'layers-over-video.gif');
+    await js(`__af.exportTo({ kind: 'gif', target: ${JSON.stringify(gifx)}, name: 'layers', scale: 0.25, withRef: true })`);
+    vl.gif = fs.existsSync(gifx) && gifInfo(fs.readFileSync(gifx));
+    const s4 = vl.mp4.samples || {};
+    check('video layers: transformed, in sync when stepping and playing, exported with the other layers',
+      near(vl.first, [[300, 200], [940, 200], [940, 560], [300, 560]]) && near(vl.second, [[900, 530], [1220, 530], [1220, 710], [900, 710]]) &&
+        vl.sound.join() === ',,true,false' &&
+        vl.levels.every(([a, b], i) => Math.abs(a - 10 * i) <= 8 && Math.abs(b - 10 * i) <= 8) &&
+        vl.inSync >= vl.play.length * 0.8 &&
+        vl.mp4.audio && Math.abs(vl.mp4.duration - 2) < 0.1 && vl.mp4.width === 640 &&
+        Math.abs(s4.first[0] - 10) <= 10 && Math.abs(s4.second[0] - 10) <= 12 && ['red', 'blue'].includes(colour(s4.bent)) && s4.paper.slice(0, 3).every(v => v > 225) &&
+        vl.gif && vl.gif.frames === 48,
+      vl);
   }
 
   // Donate window from donate.json.

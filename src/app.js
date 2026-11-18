@@ -81,7 +81,12 @@ const audio = $('#audio');
 let doc = null; // { width, height, fps, paper, frames, file, name }
 let ticks = [0]; // start tick of every frame, plus the total at the end
 let cur = 0;
-let ref = null; // image reference object or a VideoRef, both with { kind, file, name, opacity, visible, layer, rect }
+// Reference layers under the drawings, bottom first: pictures and VideoRefs, each with { kind, file, name, opacity,
+// visible, layer, rect (where it sits before any transform), quad (its four corners on the sheet: top left, top
+// right, bottom right, bottom left of the picture) }.
+const refs = [];
+let sel = null; // the reference the panel and the transform frame work on
+let xform = false; // transform mode: the pen moves, scales and rotates the selected reference instead of drawing
 let editSketch = false; // the brush draws the own reference (doc.sketch) instead of the current frame
 let dirty = false;
 let editRev = 0;
@@ -134,7 +139,7 @@ function releaseDoc(old, keep) {
     if (e.type === 'pixels') {
       gpu.free(e.data);
       frames.add(e.frame);
-    } else {
+    } else if (e.type === 'struct') {
       for (const snapshot of [e.before, e.after]) for (const [f] of snapshot.frames) frames.add(f);
     }
   }
@@ -147,7 +152,8 @@ function releaseDoc(old, keep) {
 
 function setDoc({ width, height, fps, paper = '#ffffff', frames = null, sketch = null, file = null }) {
   stopPlayback();
-  removeReference(true);
+  setXform(false);
+  removeAllReferences();
   const fresh = frames || [makeFrame(prefs.step)];
   const own = sketch || makeSketch();
   if (doc) releaseDoc(doc, new Set([...fresh, own]));
@@ -187,6 +193,7 @@ function applyView() {
   $('#zoomBtn').textContent = `${Math.round(view.zoom * 100)}%`;
   $('#mirrorBtn').classList.toggle('on', view.mirror);
   shapeCursor();
+  drawXform();
   requestRender();
 }
 
@@ -239,20 +246,72 @@ function requestRender() {
   requestAnimationFrame(render);
 }
 
-function refSub() {
-  const r = ref.rect;
-  return [r.x / doc.width, r.y / doc.height, r.w / doc.width, r.h / doc.height];
+// A reference is drawn through the projective map that takes its picture onto its quad: one matrix covers moving,
+// scaling, rotating, mirroring and perspective. The shader gets the inverse, from document uv to picture uv.
+function squareToQuad([[x0, y0], [x1, y1], [x2, y2], [x3, y3]]) {
+  // Heckbert, "Fundamentals of Texture Mapping and Image Warping" (1989): unit square -> quad, row-major 3x3.
+  const sx = x0 - x1 + x2 - x3;
+  const sy = y0 - y1 + y2 - y3;
+  let g = 0;
+  let h = 0;
+  if (Math.abs(sx) > 1e-9 || Math.abs(sy) > 1e-9) {
+    const dx1 = x1 - x2;
+    const dx2 = x3 - x2;
+    const dy1 = y1 - y2;
+    const dy2 = y3 - y2;
+    const den = dx1 * dy2 - dx2 * dy1;
+    g = (sx * dy2 - dx2 * sy) / den;
+    h = (dx1 * sy - sx * dy1) / den;
+  }
+  return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h, 1];
+}
+
+function invert3([a, b, c, d, e, f, g, h, i]) {
+  const A = e * i - f * h;
+  const B = f * g - d * i;
+  const C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  return [A, c * h - b * i, b * f - c * e, B, a * i - c * g, c * d - a * f, C, b * g - a * h, a * e - b * d].map(v => v / det);
+}
+
+// Document pixels -> picture uv, cached per quad (a quad is replaced, never edited in place).
+function quadInverse(r) {
+  if (r.inv?.quad !== r.quad) r.inv = { quad: r.quad, m: invert3(squareToQuad(r.quad)) };
+  return r.inv.m;
+}
+
+// Where a document point falls on the picture: [u, v], inside when both are in 0..1.
+function uvAt(r, x, y) {
+  const m = quadInverse(r);
+  const w = m[6] * x + m[7] * y + m[8];
+  if (w <= 0) return [-1, -1];
+  return [(m[0] * x + m[1] * y + m[2]) / w, (m[3] * x + m[4] * y + m[5]) / w];
+}
+
+const quadArea = q => Math.abs(q.reduce((s, [x, y], i) => s + x * q[(i + 1) % 4][1] - q[(i + 1) % 4][0] * y, 0)) / 2;
+
+function refOp(r, layer, opacity) {
+  const m = quadInverse(r);
+  const W = doc.width;
+  const H = doc.height;
+  return {
+    layer,
+    xf: new Float32Array([m[0] * W, m[3] * W, m[6] * W, m[1] * H, m[4] * H, m[7] * H, m[2], m[5], m[8]]),
+    px: Math.sqrt(quadArea(r.quad) / (layer.w * layer.h)),
+    opacity,
+  };
 }
 
 const maskFor = f => (stroke?.frame === f ? { color: rgba(stroke.color), erase: stroke.erase } : null);
 
-// Back to front: paper, reference, own reference, onion ghosts (the far ones first), the drawing with the stroke in
-// progress. While the own reference is being drawn it comes forward at full strength and the animation steps back.
+// Back to front: paper, references (the lowest first), own reference, onion ghosts (the far ones first), the drawing
+// with the stroke in progress. While the own reference is being drawn it comes forward at full strength and the
+// animation steps back.
 function sceneOps({ paper = true, reference = true, sketch = true, ghosts = true, drawing = true, refOpacity = null } = {}) {
   const ops = [];
   const editing = editSketch && !playing;
   if (paper) ops.push({ color: rgba(doc.paper) });
-  if (reference && ref?.visible && ref.layer) ops.push({ layer: ref.layer, sub: refSub(), opacity: refOpacity ?? ref.opacity });
+  if (reference) for (const r of refs) if (r.visible && r.layer) ops.push(refOp(r, r.layer, refOpacity ?? r.opacity));
   const sk = doc.sketch;
   if (sketch && sk.layer && (sk.visible || editing)) ops.push({ layer: sk.layer, opacity: editing ? 1 : sk.opacity, mask: maskFor(sk) });
   const o = prefs.onion;
@@ -311,10 +370,12 @@ async function contextRestored() {
     if (had && f.saved?.rev !== f.rev) lost++;
     if (f.layer) scheduleThumb(f);
   }
-  if (ref?.kind === 'image') layoutImage();
-  else if (ref?.kind === 'video') {
-    ref.layer = gpu.layer(ref.rect.w, ref.rect.h);
-    ref.shownTick = null;
+  for (const r of refs) {
+    if (r.kind === 'image') uploadImage(r);
+    else {
+      r.layer = gpu.layer(r.size.w, r.size.h);
+      r.shownTick = null;
+    }
   }
   showFrame(cur);
   const text = lost ? `Відеокарта перезапустилася: ${nFrames(lost)} повернуто до останнього автозбереження` : 'Відеокарта перезапустилася, усе відновлено';
@@ -512,6 +573,7 @@ function undo() {
   if (!e) return;
   stopPlayback();
   if (e.type === 'pixels') swapPixels(e);
+  else if (e.type === 'xf') applyQuad(e.ref, e.before);
   else restore(e.before);
   redoStack.push(e);
   changed();
@@ -522,6 +584,7 @@ function redo() {
   if (!e) return;
   stopPlayback();
   if (e.type === 'pixels') swapPixels(e);
+  else if (e.type === 'xf') applyQuad(e.ref, e.after);
   else restore(e.after);
   undoStack.push(e);
   changed();
@@ -717,12 +780,14 @@ function pickColor(e) {
 }
 
 stage.addEventListener('pointerdown', e => {
-  if (!doc || $('#modal').childElementCount) return;
+  if (!doc || $('#modal').childElementCount || e.target.closest('#xfBadge')) return;
   moveCursor(e);
   if (e.button === 1 || (e.button === 0 && space.down)) {
     space.used = space.down;
     pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
     flag('panning', true, why(e));
+  } else if (xform) {
+    if (e.button !== 0 || !xfDown(e)) return;
   } else if (e.button === 0 || e.button === 5) {
     if (e.altKey) return pickColor(e);
     startStroke(e);
@@ -744,16 +809,21 @@ stage.addEventListener('pointermove', e => {
     perf.moves++;
     perf.ms += ms;
     perf.max = Math.max(perf.max, ms);
+  } else if (drag) {
+    xfMove(e);
   } else if (pan) {
     view.x = pan.vx + e.clientX - pan.x;
     view.y = pan.vy + e.clientY - pan.y;
     view.fitted = false;
     applyView();
+  } else if (xform) {
+    xfHover(e);
   }
 });
 
 const endPointer = e => {
   if (stroke) endStroke();
+  if (drag) xfUp();
   if (pan) {
     pan = null;
     flag('panning', false, why(e));
@@ -878,7 +948,7 @@ function cursorSnapshot() {
     stageSize: [stage.clientWidth, stage.clientHeight], hoverId, stroke: !!stroke, pan: !!pan, space: { ...space },
     focus: document.hasFocus(), visibility: document.visibilityState, active: describe(document.activeElement), modal: $('#modal').childElementCount > 0,
     under: last ? describe(document.elementFromPoint(last.x, last.y)) : '-',
-    tool: prefs.tool, size: prefs.sizes[prefs.tool], zoom: +view.zoom.toFixed(3), dpr: dpr(), editSketch, playing: !!playing,
+    tool: prefs.tool, size: prefs.sizes[prefs.tool], zoom: +view.zoom.toFixed(3), dpr: dpr(), editSketch, xform, playing: !!playing,
     now: Math.round(performance.now()), raw: { ...raw }, trail,
   };
   af.log(`cursor snapshot ${JSON.stringify(s)}`);
@@ -988,64 +1058,116 @@ function setColor(color) {
 
 // ---------- reference ----------
 
-// Each decoded video frame goes straight into the reference texture.
-function drawRefFrame(canvas) {
-  if (!canvas || !ref?.layer || gpu.lost) return;
-  gpu.upload(ref.layer, canvas);
+const videos = () => refs.filter(r => r.kind === 'video');
+
+// Each decoded video frame goes straight into its reference texture.
+function drawRefFrame(r, canvas) {
+  if (!canvas || !r.layer || gpu.lost || canvas.width !== r.layer.w || canvas.height !== r.layer.h) return;
+  gpu.upload(r.layer, canvas);
   requestRender();
 }
 
-// A picture is uploaded once, scaled down only if it is bigger than the GPU takes.
-function layoutImage() {
-  const s = Math.min(doc.width / ref.width, doc.height / ref.height);
-  const w = Math.round(ref.width * s);
-  const h = Math.round(ref.height * s);
-  ref.rect = { x: Math.round((doc.width - w) / 2), y: Math.round((doc.height - h) / 2), w, h };
-  const k = Math.min(1, Math.min(gpu.maxSize, 8192) / Math.max(ref.width, ref.height));
-  const c = Object.assign(document.createElement('canvas'), { width: Math.round(ref.width * k), height: Math.round(ref.height * k) });
-  c.getContext('2d').drawImage(ref.bitmap, 0, 0, c.width, c.height);
-  gpu.free(ref.layer);
-  ref.layer = gpu.layer(c.width, c.height);
-  gpu.upload(ref.layer, c);
+// Where a picture or video sits before it is transformed: contain-fit into the sheet, centred.
+function fitRect(w0, h0) {
+  const s = Math.min(doc.width / w0, doc.height / h0);
+  const w = Math.round(w0 * s);
+  const h = Math.round(h0 * s);
+  return { x: Math.round((doc.width - w) / 2), y: Math.round((doc.height - h) / 2), w, h };
+}
+
+const rectQuad = ({ x, y, w, h }) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+
+// A picture is uploaded once at its own resolution (so scaling it up stays sharp), smaller only if it is bigger than
+// the GPU takes.
+function uploadImage(r) {
+  const k = Math.min(1, Math.min(gpu.maxSize, 8192) / Math.max(r.width, r.height));
+  const c = Object.assign(document.createElement('canvas'), { width: Math.round(r.width * k), height: Math.round(r.height * k) });
+  c.getContext('2d').drawImage(r.bitmap, 0, 0, c.width, c.height);
+  gpu.free(r.layer);
+  r.layer = gpu.layer(c.width, c.height);
+  gpu.upload(r.layer, c);
   requestRender();
 }
 
-// The video texture matches the area the video takes on the sheet.
-function layoutVideo(offset) {
-  ref.layout(doc.width, doc.height, doc.fps, offset);
-  gpu.free(ref.layer);
-  ref.layer = gpu.layer(ref.rect.w, ref.rect.h);
+// The video texture is the size frames are decoded at: the area on the sheet, more when the video is scaled up
+// (up to its own resolution).
+function layoutVideo(r, offset = r.offset, k = r.decodeK || 1) {
+  r.layout(doc.width, doc.height, doc.fps, offset, k);
+  r.decodeK = k;
+  gpu.free(r.layer);
+  r.layer = gpu.layer(r.size.w, r.size.h);
+}
+
+function fitDecode(r) {
+  if (r.kind !== 'video') return;
+  const s = Math.sqrt(quadArea(r.quad) / (r.rect.w * r.rect.h));
+  const most = Math.max(1, Math.min(r.width / r.rect.w, Math.min(gpu.maxSize, 4096) / Math.max(r.rect.w, r.rect.h)));
+  const k = clamp(s, 1, most);
+  const now = r.decodeK || 1;
+  if (Math.abs(k - now) / now < 0.15) return;
+  layoutVideo(r, r.offset, k);
+  syncReference();
 }
 
 function syncReference() {
   requestRender();
-  if (ref?.kind !== 'video' || playing) return;
-  ref.show(ticks[cur]);
+  if (playing) return;
   const ahead = [];
   for (let k = 1; k <= 4 && cur + k < doc.frames.length; k++) ahead.push(ticks[cur + k]);
   if (cur > 0) ahead.push(ticks[cur - 1]);
-  ref.prefetch(ahead);
+  for (const r of videos()) {
+    r.show(ticks[cur]);
+    r.prefetch(ahead);
+  }
 }
 
+// One audio element: it plays the video whose sound is on (at most one has it).
+const soundRef = () => videos().find(r => r.sound && r.hasAudio) || null;
+
+async function updateAudio() {
+  const file = soundRef()?.file || '';
+  if (audio.dataset.file === file) return;
+  audio.dataset.file = file;
+  if (file) audio.src = await af.fileURL(file);
+  else {
+    audio.removeAttribute('src');
+    audio.load();
+  }
+}
+
+const validQuad = q => Array.isArray(q) && q.length === 4 && q.every(p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite));
+
+let nextRefId = 1;
+
+// Adds a picture or a video as a new reference layer on top of the others.
 async function loadReference(file, o = {}) {
   const ext = file.split('.').pop().toLowerCase();
   if (!VIDEO_EXT.has(ext) && !IMAGE_EXT.has(ext)) throw new Error('Підтримуються картинки (PNG, JPG, WebP) і відео (MP4, MOV, WebM, MKV)');
   stopPlayback();
+  let r;
   if (VIDEO_EXT.has(ext)) {
     const video = await openVideo(file);
     let note = '';
-    if (pristine() && o.adopt !== false) {
+    if (pristine() && !refs.length && o.adopt !== false) {
       // Nothing drawn yet: the project takes the video's size and frame rate and stretches over the whole clip.
       const width = video.width - (video.width % 2);
       const height = video.height - (video.height % 2);
       setDoc({ width, height, fps: video.fps, paper: doc.paper });
       note = `Проєкт підлаштовано під відео: ${width}×${height}, ${fmtFps(video.fps)} к/с`;
     }
-    removeReference(true);
-    ref = Object.assign(video, { name: basename(file), opacity: o.opacity ?? 1, visible: o.visible ?? true, sound: o.sound ?? true });
-    video.onFrame = drawRefFrame;
-    layoutVideo(o.offset || 0);
-    audio.src = await af.fileURL(file);
+    r = Object.assign(video, {
+      id: nextRefId++,
+      name: basename(file),
+      opacity: o.opacity ?? 1,
+      visible: o.visible ?? true,
+      sound: o.sound ?? !videos().some(v => v.sound),
+    });
+    video.onFrame = canvas => drawRefFrame(r, canvas);
+    refs.push(r);
+    layoutVideo(r, o.offset || 0, 1);
+    r.quad = validQuad(o.quad) ? o.quad : rectQuad(r.rect);
+    fitDecode(r);
+    await updateAudio();
     if (note) {
       const total = video.ticks();
       const frames = [];
@@ -1060,40 +1182,55 @@ async function loadReference(file, o = {}) {
   } else {
     const bytes = o.bytes || (await af.read(file));
     const bitmap = await createImageBitmap(new Blob([bytes]));
-    removeReference(true);
-    ref = { kind: 'image', file, name: basename(file), bytes, bitmap, width: bitmap.width, height: bitmap.height, opacity: o.opacity ?? 0.5, visible: o.visible ?? true };
-    layoutImage();
+    r = { id: nextRefId++, kind: 'image', file, name: basename(file), bytes, bitmap, width: bitmap.width, height: bitmap.height, opacity: o.opacity ?? 0.5, visible: o.visible ?? true };
+    refs.push(r);
+    r.rect = fitRect(r.width, r.height);
+    r.quad = validQuad(o.quad) ? o.quad : rectQuad(r.rect);
+    uploadImage(r);
     syncReference();
   }
+  if (o.select !== false) sel = r;
   if (!o.quiet) changed();
   refreshUI();
+  drawXform();
+  return r;
 }
 
-function removeReference(quiet = false) {
-  if (!ref) return;
+function removeReference(r = sel, quiet = false) {
+  const i = refs.indexOf(r);
+  if (i < 0) return;
   stopPlayback();
-  if (ref.kind === 'video') ref.dispose();
-  else ref.bitmap?.close();
-  gpu.free(ref.layer);
-  ref = null;
-  audio.removeAttribute('src');
-  audio.load();
+  if (r.kind === 'video') r.dispose();
+  else r.bitmap?.close();
+  gpu.free(r.layer);
+  r.layer = null;
+  refs.splice(i, 1);
+  // Its transforms leave the undo history with it.
+  for (const stack of [undoStack, redoStack]) for (let k = stack.length - 1; k >= 0; k--) if (stack[k].ref === r) stack.splice(k, 1);
+  if (sel === r) sel = refs[Math.min(i, refs.length - 1)] || null;
+  if (!refs.length) setXform(false);
+  updateAudio();
   requestRender();
+  drawXform();
   if (!quiet) {
     changed();
     refreshUI();
   }
 }
 
+function removeAllReferences() {
+  for (const r of [...refs]) removeReference(r, true);
+}
+
 function relayoutVideo() {
-  if (ref?.kind !== 'video') return;
-  layoutVideo(ref.offset);
+  for (const r of videos()) layoutVideo(r);
   syncReference();
 }
 
 function fillToVideo() {
-  if (ref?.kind !== 'video') return;
-  const need = ref.ticks();
+  const v = sel?.kind === 'video' ? sel : videos()[0];
+  if (!v) return;
+  const need = v.ticks();
   if (totalTicks() >= need) return toast('Таймлайн уже покриває все відео');
   structural(() => {
     let t = totalTicks();
@@ -1148,11 +1285,315 @@ async function pasteReference(data) {
   toast('У буфері немає картинки: скопіюй картинку або файл картинки чи відео й натисни Ctrl+V');
 }
 
+// ---------- reference layers ----------
+
+function selectRef(r) {
+  if (!r || sel === r) return;
+  sel = r;
+  refreshRefs();
+  drawXform();
+}
+
+function setRefVisible(r, v, quiet = false) {
+  r.visible = v;
+  if (playing && r.kind === 'video') {
+    if (v) r.play(Math.floor(clock() * doc.fps), clock);
+    else r.stop();
+  }
+  syncReference();
+  drawXform();
+  if (!quiet) {
+    refreshRefs();
+    changed();
+  }
+}
+
+// R hides every reference that shows, and the next R brings the same ones back.
+let hiddenByR = [];
+function toggleRefs() {
+  if (!refs.length) return;
+  const shown = refs.filter(r => r.visible);
+  if (shown.length) hiddenByR = shown;
+  const back = hiddenByR.filter(r => refs.includes(r));
+  for (const r of shown.length ? shown : back.length ? back : refs) setRefVisible(r, !shown.length, true);
+  refreshRefs();
+  changed();
+}
+
+// d = +1 one layer up (towards the drawings), -1 one down.
+function moveRef(r, d) {
+  const i = refs.indexOf(r);
+  const j = i + d;
+  if (i < 0 || j < 0 || j >= refs.length) return;
+  refs.splice(i, 1);
+  refs.splice(j, 0, r);
+  refreshRefs();
+  drawXform();
+  requestRender();
+  changed();
+}
+
+function setRefSound(r, on) {
+  stopPlayback();
+  for (const v of videos()) v.sound = v === r ? on : on ? false : v.sound;
+  updateAudio();
+  refreshRefs();
+  changed();
+}
+
+// ---------- transform ----------
+// T (or the frame button) puts the selected reference in a frame with handles. With the pen: drag inside to move,
+// drag a corner to scale in proportion (Shift: freely, Alt: from the centre, Ctrl: that corner alone, for
+// perspective), drag the knob above the frame or anywhere outside it to rotate (Shift: in 15° steps). A tap on
+// another reference picks it. Every drag is one undo step. Corners are kept in document pixels.
+
+let drag = null;
+
+function setXform(v = !xform) {
+  if (v === xform || stroke || drag) return;
+  if (v && !refs.length) return toast('Спершу додай референс: Ctrl+I, Ctrl+V або перетягни файл у вікно');
+  if (v) {
+    stopPlayback();
+    if (editSketch) setEditSketch(false);
+    if (!sel) sel = refs[refs.length - 1];
+    if (!sel.visible) setRefVisible(sel, true);
+  }
+  xform = v;
+  flag('xform', v, v ? 'transform on' : 'transform off');
+  document.body.classList.toggle('xforming', v);
+  stage.dataset.zone = '';
+  refreshRefs();
+  drawXform();
+}
+
+const stageXY = e => {
+  const r = stage.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+};
+const docXY = e => toDoc(e, sheet.getBoundingClientRect());
+const onStage = ([x, y]) => [view.x + (view.mirror ? doc.width - x : x) * cssScale(), view.y + y * cssScale()];
+const centre = q => [q.reduce((s, p) => s + p[0], 0) / 4, q.reduce((s, p) => s + p[1], 0) / 4];
+
+function inside(r, [x, y]) {
+  const [u, v] = uvAt(r, x, y);
+  return u >= 0 && u <= 1 && v >= 0 && v <= 1;
+}
+
+// The frame on screen: corners, the middle of the top edge and the rotation knob 30 px beyond it.
+function frameOf(q) {
+  const s = q.map(onStage);
+  const c = centre(s);
+  const m = [(s[0][0] + s[1][0]) / 2, (s[0][1] + s[1][1]) / 2];
+  const n = Math.hypot(m[0] - c[0], m[1] - c[1]) || 1;
+  return { s, c, m, knob: [m[0] + ((m[0] - c[0]) / n) * 30, m[1] + ((m[1] - c[1]) / n) * 30] };
+}
+
+// What the pen is over: the knob, a corner (with the resize cursor that fits its direction), the selected
+// reference, another one, or empty space around (rotates the selected one).
+function zoneAt(e) {
+  const p = stageXY(e);
+  const d = docXY(e);
+  const near = (a, radius) => Math.hypot(a[0] - p[0], a[1] - p[1]) <= radius;
+  if (sel?.visible) {
+    const { s, c, knob } = frameOf(sel.quad);
+    if (near(knob, 14)) return { kind: 'rotate', cursor: 'rot' };
+    for (let i = 0; i < 4; i++) {
+      if (near(s[i], 13)) return { kind: 'corner', i, cursor: (s[i][0] - c[0]) * (s[i][1] - c[1]) > 0 ? 'nwse' : 'nesw' };
+    }
+    if (inside(sel, d)) return { kind: 'move', cursor: 'move' };
+  }
+  for (let i = refs.length - 1; i >= 0; i--) {
+    if (refs[i] !== sel && refs[i].visible && inside(refs[i], d)) return { kind: 'move', ref: refs[i], cursor: 'move' };
+  }
+  return sel?.visible ? { kind: 'rotate', cursor: 'rot' } : null;
+}
+
+function xfHover(e) {
+  stage.dataset.zone = zoneAt(e)?.cursor || '';
+}
+
+function xfDown(e) {
+  const z = zoneAt(e);
+  if (!z) return false;
+  if (z.ref) selectRef(z.ref);
+  drag = { r: sel, kind: z.kind, i: z.i, q0: sel.quad, p0: docXY(e), moved: false };
+  stage.dataset.zone = z.cursor;
+  return true;
+}
+
+function rotateQuad(q0, p0, p, snap) {
+  const [cx, cy] = centre(q0);
+  let a = Math.atan2(p[1] - cy, p[0] - cx) - Math.atan2(p0[1] - cy, p0[0] - cx);
+  if (snap) {
+    const top = Math.atan2(q0[1][1] - q0[0][1], q0[1][0] - q0[0][0]);
+    const step = Math.PI / 12;
+    a = Math.round((top + a) / step) * step - top;
+  }
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return q0.map(([x, y]) => [cx + (x - cx) * c - (y - cy) * s, cy + (x - cx) * s + (y - cy) * c]);
+}
+
+// Corner i follows the pen; the opposite corner (or the centre) stays put.
+function scaleQuad(q0, i, p0, p, free, fromCentre) {
+  const a = q0[(i + 2) % 4];
+  const o = fromCentre ? centre(q0) : a;
+  if (!free) {
+    const vx = p0[0] - o[0];
+    const vy = p0[1] - o[1];
+    const k = ((p[0] - o[0]) * vx + (p[1] - o[1]) * vy) / (vx * vx + vy * vy || 1);
+    if (k < 0.02) return null;
+    return q0.map(([x, y]) => [o[0] + (x - o[0]) * k, o[1] + (y - o[1]) * k]);
+  }
+  // Freely: a separate stretch along each of the two edges that meet at the opposite corner.
+  const e1 = [q0[(i + 3) % 4][0] - a[0], q0[(i + 3) % 4][1] - a[1]];
+  const e2 = [q0[(i + 1) % 4][0] - a[0], q0[(i + 1) % 4][1] - a[1]];
+  const det = e1[0] * e2[1] - e1[1] * e2[0];
+  if (Math.abs(det) < 1e-6) return null;
+  const along = ([x, y]) => {
+    const X = x - o[0];
+    const Y = y - o[1];
+    return [(X * e2[1] - Y * e2[0]) / det, (e1[0] * Y - e1[1] * X) / det];
+  };
+  const [a0, b0] = along(p0);
+  const [a1, b1] = along(p);
+  const sa = Math.abs(a0) > 1e-6 ? a1 / a0 : 1;
+  const sb = Math.abs(b0) > 1e-6 ? b1 / b0 : 1;
+  if (sa < 0.02 || sb < 0.02) return null;
+  return q0.map(c => {
+    const [s, t] = along(c);
+    return [o[0] + s * sa * e1[0] + t * sb * e2[0], o[1] + s * sa * e1[1] + t * sb * e2[1]];
+  });
+}
+
+// A quad the picture can be drawn on: convex, no edge shorter than 2 px.
+function sane(q) {
+  let sign = 0;
+  for (let k = 0; k < 4; k++) {
+    const [ax, ay] = q[k];
+    const [bx, by] = q[(k + 1) % 4];
+    const [cx, cy] = q[(k + 2) % 4];
+    const z = (bx - ax) * (cy - by) - (by - ay) * (cx - bx);
+    if (Math.abs(z) < 1e-3 || Math.hypot(bx - ax, by - ay) < 2) return false;
+    if (sign && Math.sign(z) !== sign) return false;
+    sign = Math.sign(z);
+  }
+  return true;
+}
+
+function xfMove(e) {
+  const { r, kind, i, q0, p0 } = drag;
+  const p = docXY(e);
+  const dx = p[0] - p0[0];
+  const dy = p[1] - p0[1];
+  if (!drag.moved && Math.hypot(dx, dy) * cssScale() < 2) return; // a tap is not a drag
+  drag.moved = true;
+  let q;
+  if (kind === 'move') q = q0.map(([x, y]) => [x + dx, y + dy]);
+  else if (kind === 'rotate') q = rotateQuad(q0, p0, p, e.shiftKey);
+  else if (e.ctrlKey || e.metaKey) q = q0.map((c, k) => (k === i ? [c[0] + dx, c[1] + dy] : c));
+  else q = scaleQuad(q0, i, p0, p, e.shiftKey, e.altKey);
+  if (!q || !sane(q)) return;
+  r.quad = q;
+  requestRender();
+  drawXform();
+}
+
+function xfUp() {
+  const { r, q0, moved } = drag;
+  drag = null;
+  if (!moved || r.quad === q0) return;
+  pushUndo({ type: 'xf', ref: r, before: q0, after: r.quad });
+  fitDecode(r);
+  drawXform();
+}
+
+// Undo and redo of a transform. Like any undo, it never changes what cannot be seen.
+function applyQuad(r, q) {
+  if (!refs.includes(r)) return;
+  r.quad = q;
+  sel = r;
+  if (!r.visible) setRefVisible(r, true, true);
+  fitDecode(r);
+  refreshRefs();
+  drawXform();
+  requestRender();
+}
+
+function setQuad(r, q) {
+  if (!r || JSON.stringify(q) === JSON.stringify(r.quad)) return;
+  pushUndo({ type: 'xf', ref: r, before: r.quad, after: q });
+  applyQuad(r, q);
+}
+
+// Mirrored left to right within its own frame: the corners swap places, the frame stays.
+const flipRef = (r = sel) => r && setQuad(r, [r.quad[1], r.quad[0], r.quad[3], r.quad[2]]);
+const resetRef = (r = sel) => r && setQuad(r, rectQuad(r.rect));
+
+function drawXform() {
+  const svg = $('#xfFrame');
+  if (!doc || !xform) return svg.replaceChildren();
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (name, attrs) => {
+    const n = document.createElementNS(NS, name);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  };
+  const points = q => q.map(onStage).map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const parts = [];
+  for (const r of refs) if (r !== sel && r.visible) parts.push(el('polygon', { points: points(r.quad), class: 'other' }));
+  if (sel?.visible) {
+    const { s, m, knob } = frameOf(sel.quad);
+    parts.push(el('polygon', { points: points(sel.quad), class: 'shade' }), el('polygon', { points: points(sel.quad), class: 'frame' }));
+    parts.push(el('line', { x1: m[0], y1: m[1], x2: knob[0], y2: knob[1], class: 'stick' }), el('circle', { cx: knob[0], cy: knob[1], r: 6, class: 'knob' }));
+    for (const [x, y] of s) parts.push(el('rect', { x: x - 5, y: y - 5, width: 10, height: 10, class: 'handle' }));
+  }
+  svg.replaceChildren(...parts);
+  $('#xfName').textContent = sel?.name || '';
+}
+
+// A round arrow for "rotate", drawn like the cross: white with a dark edge.
+function rotateCursor() {
+  const image = scale => {
+    const c = Object.assign(document.createElement('canvas'), { width: 21 * scale, height: 21 * scale });
+    const g = c.getContext('2d');
+    g.scale(scale, scale);
+    const a = Math.PI * 2.25;
+    const [ex, ey] = [10.5 + 6.5 * Math.cos(a), 10.5 + 6.5 * Math.sin(a)];
+    const [tx, ty, nx, ny] = [-Math.sin(a), Math.cos(a), Math.cos(a), Math.sin(a)];
+    const shape = () => {
+      g.beginPath();
+      g.arc(10.5, 10.5, 6.5, Math.PI * 0.85, a - 0.25);
+      g.stroke();
+      g.beginPath();
+      g.moveTo(ex + tx * 3.5, ey + ty * 3.5);
+      g.lineTo(ex + nx * 3.5 - tx * 1.5, ey + ny * 3.5 - ty * 1.5);
+      g.lineTo(ex - nx * 3.5 - tx * 1.5, ey - ny * 3.5 - ty * 1.5);
+      g.closePath();
+    };
+    g.strokeStyle = g.fillStyle = 'rgba(0, 0, 0, .7)';
+    g.lineWidth = 3.5;
+    shape();
+    g.stroke();
+    g.strokeStyle = g.fillStyle = '#fff';
+    g.lineWidth = 1.5;
+    shape();
+    g.fill();
+    return `url(${c.toDataURL()})`;
+  };
+  const sharp = `image-set(${image(1)} 1x, ${image(2)} 2x) 10 10, alias`;
+  const style = document.createElement('style');
+  style.textContent = `#stage.xform[data-zone="rot"] { cursor: ${CSS.supports('cursor', sharp) ? sharp : `${image(1)} 10 10, alias`}; }`;
+  document.head.append(style);
+}
+rotateCursor();
+
 // ---------- own reference ----------
 
 function setEditSketch(v = !editSketch) {
-  if (stroke || v === editSketch) return;
+  if (stroke || drag || v === editSketch) return;
   stopPlayback();
+  if (v) setXform(false);
   editSketch = v;
   if (v && !doc.sketch.visible) {
     doc.sketch.visible = true;
@@ -1191,7 +1632,8 @@ let playing = null;
 const clock = () => (playing ? playing.from / doc.fps + (performance.now() - playing.t0) / 1000 : 0);
 
 function play() {
-  if (playing || !doc) return;
+  if (playing || !doc || drag) return;
+  setXform(false);
   const from = cur >= doc.frames.length - 1 ? 0 : ticks[cur];
   playing = { t0: performance.now(), from, tick: -1 };
   requestRender();
@@ -1202,11 +1644,13 @@ function play() {
 }
 
 function startVideo(from) {
-  if (ref?.kind !== 'video') return;
-  if (ref.visible) ref.play(from, clock);
-  if (from !== 0 && prefs.loop) ref.prefetch([0]); // ready for the loop back to the start
-  if (ref.sound && ref.hasAudio && audio.src) {
-    audio.currentTime = Math.max(0, ref.localTime(from));
+  for (const r of videos()) {
+    if (r.visible) r.play(from, clock);
+    if (from !== 0 && prefs.loop) r.prefetch([0]); // ready for the loop back to the start
+  }
+  const s = soundRef();
+  if (s && audio.src) {
+    audio.currentTime = Math.max(0, s.localTime(from));
     audio.play().catch(() => {});
   }
 }
@@ -1222,10 +1666,8 @@ function playLoop() {
     playing.t0 = performance.now();
     playing.from = 0;
     t = 0;
-    if (ref?.kind === 'video') {
-      ref.stop();
-      startVideo(0);
-    }
+    for (const r of videos()) r.stop();
+    startVideo(0);
   }
   if (t !== playing.tick) {
     playing.tick = t;
@@ -1244,7 +1686,7 @@ function playLoop() {
 function stopPlayback() {
   if (!playing) return;
   playing = null;
-  if (ref?.kind === 'video') ref.stop();
+  for (const r of videos()) r.stop();
   audio.pause();
   $('#playBtn').classList.remove('on');
   $('#playBtn').innerHTML = '<svg viewBox="0 0 24 24"><path class="fill" d="M8 5.5v13l10.5-6.5z"/></svg>';
@@ -1303,27 +1745,30 @@ async function serialize() {
     if (f.layer && f.saved?.rev !== f.rev) f.saved = { rev: f.rev, png: await pngBytes(f.layer) };
     frames.push({ hold: f.hold, png: f.layer ? f.saved.png : null });
   }
-  const reference = ref && {
-    kind: ref.kind,
-    file: ref.file,
-    name: ref.name,
-    opacity: ref.opacity,
-    visible: ref.visible,
-    offset: ref.offset || 0,
-    sound: ref.sound,
-  };
+  // Bottom first; pictures travel inside the project, videos by path.
+  const references = refs.map(r => ({
+    kind: r.kind,
+    file: r.file,
+    name: r.name,
+    opacity: r.opacity,
+    visible: r.visible,
+    offset: r.offset || 0,
+    sound: r.sound,
+    quad: r.quad.map(([x, y]) => [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000]),
+    data: r.kind === 'image' ? r.bytes : null,
+  }));
   const sk = doc.sketch;
   if (sk.layer && sk.saved?.rev !== sk.rev) sk.saved = { rev: sk.rev, png: await pngBytes(sk.layer) };
   return {
-    meta: { width: doc.width, height: doc.height, fps: doc.fps, paper: doc.paper, cur, reference },
+    meta: { width: doc.width, height: doc.height, fps: doc.fps, paper: doc.paper, cur, refSel: refs.indexOf(sel) },
     frames,
-    refBytes: ref?.kind === 'image' ? ref.bytes : null,
+    refs: references,
     sketch: sk.layer ? { visible: sk.visible, opacity: sk.opacity, png: sk.saved.png } : null,
   };
 }
 
 async function applyProject(project, file) {
-  const { meta, frames: stored, reference } = project;
+  const { meta, frames: stored, references = [] } = project;
   const frames = [];
   for (const s of stored) {
     const f = makeFrame(s.hold || 1);
@@ -1339,15 +1784,18 @@ async function applyProject(project, file) {
     Object.assign(sketch, { visible: project.sketch.visible ?? true, opacity: project.sketch.opacity ?? 0.5, saved: { rev: 0, png: project.sketch.png } });
   }
   setDoc({ width: meta.width, height: meta.height, fps: meta.fps, paper: meta.paper, frames, sketch, file });
-  if (reference) {
-    const o = { ...reference, adopt: false, quiet: true, bytes: reference.data };
+  const loaded = [];
+  for (const reference of references) {
+    const o = { ...reference, adopt: false, quiet: true, select: false, bytes: reference.data };
     try {
       if (reference.kind === 'video' && !(await af.stat(reference.file))) throw new Error(`Відео-референс не знайдено: ${reference.file}`);
-      await loadReference(reference.file, o);
+      loaded.push(await loadReference(reference.file, o));
     } catch (err) {
+      loaded.push(null);
       toast(err.message, true);
     }
   }
+  selectRef(loaded[meta.refSel] || refs[refs.length - 1]);
   showFrame(meta.cur || 0);
   setDirty(false);
   autosavedRev = editRev;
@@ -1423,11 +1871,13 @@ af.onOpenFile(file => guarded(() => openProject(file)));
 
 async function exportDialog() {
   stopPlayback();
-  const video = ref?.kind === 'video';
+  // Over video the lowest visible video sets the length, the frame rate and the sound.
+  const video = refs.find(r => r.kind === 'video' && r.visible) || null;
+  const several = refs.filter(r => r.visible).length > 1;
   const st = {
     kind: prefs.exportKind || 'gif',
     scale: prefs.exportScale || 1,
-    withRef: video ? true : false,
+    withRef: !!video,
     withSketch: false,
     transparent: false,
     audio: true,
@@ -1436,7 +1886,7 @@ async function exportDialog() {
   const render = () => {
     const vid = st.kind === 'mp4' || st.kind === 'webm';
     const overVideo = video && st.withRef;
-    const n = overVideo ? ref.ticks() : totalTicks();
+    const n = overVideo ? video.ticks() : totalTicks();
     const len = `${(n / doc.fps).toFixed(2)} с${overVideo ? ' (уся довжина відео)' : ''}`;
     body.innerHTML = `
       <div class="row"><span>Формат</span><div class="choices" data-k="kind">
@@ -1445,12 +1895,12 @@ async function exportDialog() {
       <div class="row"><span>Розмір</span><div class="choices" data-k="scale">
         <button data-v="1">100%<small> ${doc.width}×${doc.height}</small></button><button data-v="0.5">50%</button><button data-v="0.25">25%</button>
       </div></div>
-      ${ref ? `<label class="row toggle"><span>Підкласти референс</span><input type="checkbox" data-t="withRef"></label>` : ''}
+      ${refs.length ? `<label class="row toggle"><span>Підкласти ${refs.length > 1 ? 'референси' : 'референс'}</span><input type="checkbox" data-t="withRef"></label>` : ''}
       ${doc.sketch.layer ? `<label class="row toggle"><span>Підкласти свій референс</span><input type="checkbox" data-t="withSketch"></label>` : ''}
-      ${overVideo && vid && ref.hasAudio ? `<label class="row toggle"><span>Звук із відео</span><input type="checkbox" data-t="audio"></label>` : ''}
+      ${overVideo && vid && video.hasAudio ? `<label class="row toggle"><span>Звук із відео</span><input type="checkbox" data-t="audio"></label>` : ''}
       ${st.kind === 'png' && !st.withRef ? `<label class="row toggle"><span>Прозорий фон</span><input type="checkbox" data-t="transparent"></label>` : ''}
-      <p class="hint" style="margin-top:10px">${len} · ${fmtFps(overVideo && vid ? ref.fps : doc.fps)} к/с${overVideo && vid ? ' (частота відео)' : ''}${st.kind === 'png' ? ` · ${n} PNG` : ''}.
-      ${overVideo ? 'Відео піде під малюнок на повну яскравість.' : ''}
+      <p class="hint" style="margin-top:10px">${len} · ${fmtFps(overVideo && vid ? video.fps : doc.fps)} к/с${overVideo && vid ? ' (частота відео)' : ''}${st.kind === 'png' ? ` · ${n} PNG` : ''}.
+      ${st.withRef && several ? 'Видимі референси підуть під малюнок на повну яскравість, так, як вони розставлені.' : overVideo ? 'Відео піде під малюнок на повну яскравість.' : ''}
       ${st.withSketch ? 'Свій референс ляже під кожен кадр на повну яскравість.' : ''}
       ${st.kind === 'gif' && st.scale === 1 && doc.width > 1000 ? 'Для GIF краще 50%: файл буде вчетверо легший.' : ''}</p>`;
     body.querySelectorAll('.choices').forEach(group => {
@@ -1488,9 +1938,12 @@ async function exportDialog() {
   await exportTo({ ...st, target, name });
 }
 
-// The exporter asks for finished pictures: paper, the reference (the picture, or a video frame it decoded itself),
-// the own reference if asked for, the drawing, composited on the GPU at the export size and read back as RGBA rows.
+// The exporter asks for finished pictures: paper, the visible references where they stand (pictures from their
+// textures, video frames the exporter decoded itself), the own reference if asked for, the drawing, composited on the
+// GPU at the export size and read back as RGBA rows.
 function exportSource() {
+  const shown = refs.filter(r => r.visible && r.layer);
+  const shownVideos = shown.filter(r => r.kind === 'video');
   return {
     width: doc.width,
     height: doc.height,
@@ -1498,17 +1951,21 @@ function exportSource() {
     frames: doc.frames,
     ticks,
     frameAtTick,
-    video: ref?.kind === 'video' ? ref : null,
-    image: ref?.kind === 'image',
+    video: shownVideos[0] || null,
+    videos: shownVideos,
     unpremultiply,
-    render(W, H, { frame, under = null, image = false, paper = true, sketch = false }) {
+    render(W, H, { frame, refs: withRefs = false, unders = null, paper = true, sketch = false }) {
       const ops = [];
       if (paper) ops.push({ color: rgba(doc.paper) });
-      if (image && ref?.kind === 'image') ops.push({ layer: ref.layer, sub: refSub() });
-      if (under) {
-        const u = gpu.scratchLayer('under', under.width, under.height);
-        gpu.upload(u, under);
-        ops.push({ layer: u, sub: refSub() });
+      if (withRefs) {
+        shown.forEach((r, i) => {
+          if (r.kind === 'image') return ops.push(refOp(r, r.layer, 1));
+          const c = unders?.get(r);
+          if (!c) return;
+          const u = gpu.scratchLayer(`under${i}`, c.width, c.height);
+          gpu.upload(u, c);
+          ops.push(refOp(r, u, 1));
+        });
       }
       if (sketch && doc.sketch.layer) ops.push({ layer: doc.sketch.layer });
       if (frame?.layer) ops.push({ layer: frame.layer });
@@ -1653,8 +2110,9 @@ const KEYS = [
   ['− =', 'утримання кадру: коротше / довше'],
   ['Пробіл', 'грати / пауза · затиснути й тягнути — рух полотна'],
   ['O', 'калька (onion skin)'],
-  ['R', 'показати / сховати референс · Shift+R — свій референс · Ctrl+I — завантажити'],
-  ['Ctrl+V', 'вставити референс з буфера: картинку чи скопійований файл картинки або відео'],
+  ['R', 'показати / сховати референси · Shift+R — свій референс · Ctrl+I — додати'],
+  ['Ctrl+V', 'вставити референс з буфера новим шаром: картинку чи скопійований файл картинки або відео'],
+  ['T', 'трансформувати референс: тягни — рух, кут — масштаб (Shift — вільно, Ctrl — перспектива, Alt — від центру), кружок над рамкою чи поза нею — поворот (Shift — по 15°), H — віддзеркалити, Enter / Esc — готово'],
   ['M', 'віддзеркалити полотно'],
   ['Колесо', 'масштаб · 0 — вмістити · середня кнопка — рух'],
   ['Ctrl+Z', 'скасувати · Ctrl+Shift+Z / Ctrl+Y — повторити'],
@@ -1721,31 +2179,61 @@ function refreshUI() {
   $('#loopBtn').classList.toggle('on', prefs.loop);
   $('#paperColor').value = doc.paper;
   $('#paperColor').nextElementSibling.style.setProperty('--c', doc.paper);
-  $('#refEmpty').hidden = !!ref;
-  $('#refInfo').hidden = !ref;
-  $('#refBtn').classList.toggle('on', !!ref?.visible);
-  $('#refBtn').disabled = !ref;
-  if (ref) {
-    $('#refName').textContent = ref.name;
-    $('#refName').title = ref.file;
-    $('#refVisible').checked = ref.visible;
-    $('#refOpacity').value = Math.round(ref.opacity * 100);
-    $('#refOpacityOut').textContent = `${Math.round(ref.opacity * 100)}%`;
-    $('#refVideo').hidden = ref.kind !== 'video';
-    if (ref.kind === 'video') {
-      $('#refMeta').textContent = `Відео ${ref.width}×${ref.height} · ${fmtFps(ref.fps)} к/с · ${ref.duration.toFixed(2)} с${ref.hasAudio ? ' · зі звуком' : ''}`;
-      $('#refSound').checked = ref.sound;
-      $('#refSound').disabled = !ref.hasAudio;
-      $('#refOffset').value = ref.offset;
-      $('#refOffset').max = ref.frameCount - 1;
-    } else {
-      $('#refMeta').textContent = `Картинка ${ref.width}×${ref.height}`;
-    }
-  }
+  refreshRefs();
   showSketch();
   $('#undoBtn').disabled = !undoStack.length;
   $('#redoBtn').disabled = !redoStack.length;
   updateInfo();
+}
+
+const ICONS = {
+  eye: '<svg viewBox="0 0 24 24"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/></svg>',
+  hidden: '<svg viewBox="0 0 24 24"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" opacity=".45"/><path d="M4 20L20 4"/></svg>',
+  image: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 16l5-5 4 4 3-3 5 5"/></svg>',
+  video: '<svg viewBox="0 0 24 24"><rect x="3.5" y="6" width="12" height="12" rx="2"/><path d="M15.5 10.5l5-3v9l-5-3z"/></svg>',
+};
+
+// The reference list, top layer first as it lies on the sheet, and the settings of the selected one.
+function refreshRefs() {
+  if (!doc) return;
+  const list = $('#refList');
+  list.replaceChildren(...[...refs].reverse().map(r => {
+    const row = document.createElement('div');
+    row.className = `layer${r === sel ? ' sel' : ''}${r.visible ? '' : ' off'}`;
+    row.title = r.file;
+    row.innerHTML = `<button class="eye" title="Показати / сховати">${r.visible ? ICONS.eye : ICONS.hidden}</button><i class="kind">${ICONS[r.kind]}</i><b></b>
+      <button class="mv" data-d="1" title="Вище"${r === refs[refs.length - 1] ? ' disabled' : ''}>↑</button><button class="mv" data-d="-1" title="Нижче"${r === refs[0] ? ' disabled' : ''}>↓</button><button class="x" title="Прибрати цей референс">×</button>`;
+    row.querySelector('b').textContent = r.name;
+    row.onclick = e => {
+      const b = e.target.closest('button');
+      if (!b) return selectRef(r);
+      if (b.classList.contains('eye')) setRefVisible(r, !r.visible);
+      else if (b.classList.contains('mv')) moveRef(r, +b.dataset.d);
+      else if (b.classList.contains('x')) removeReference(r);
+    };
+    return row;
+  }));
+  $('#refEmpty').hidden = refs.length > 0;
+  $('#refInfo').hidden = !sel;
+  $('#refBtn').classList.toggle('on', refs.some(r => r.visible));
+  $('#refBtn').disabled = !refs.length;
+  $('#xfBtn').disabled = !refs.length;
+  $('#xfBtn').classList.toggle('on', xform);
+  $('#refXform').classList.toggle('on', xform);
+  $('#refXform').firstChild.textContent = xform ? 'Готово ' : 'Трансформувати ';
+  if (!sel) return;
+  $('#refOpacity').value = Math.round(sel.opacity * 100);
+  $('#refOpacityOut').textContent = `${Math.round(sel.opacity * 100)}%`;
+  $('#refVideo').hidden = sel.kind !== 'video';
+  if (sel.kind === 'video') {
+    $('#refMeta').textContent = `Відео ${sel.width}×${sel.height} · ${fmtFps(sel.fps)} к/с · ${sel.duration.toFixed(2)} с${sel.hasAudio ? ' · зі звуком' : ''}`;
+    $('#refSound').checked = sel.sound;
+    $('#refSound').disabled = !sel.hasAudio;
+    $('#refOffset').value = sel.offset;
+    $('#refOffset').max = sel.frameCount - 1;
+  } else {
+    $('#refMeta').textContent = `Картинка ${sel.width}×${sel.height}`;
+  }
 }
 
 function buildPalette() {
@@ -1770,7 +2258,8 @@ function wire() {
   on('#undoBtn', 'click', undo);
   on('#redoBtn', 'click', redo);
   on('#onionBtn', 'click', () => toggleOnion());
-  on('#refBtn', 'click', () => toggleRef());
+  on('#refBtn', 'click', () => toggleRefs());
+  on('#xfBtn', 'click', () => setXform());
   on('#mirrorBtn', 'click', () => toggleMirror());
   on('#zoomBtn', 'click', fit);
   on('#helpBtn', 'click', helpDialog);
@@ -1821,23 +2310,27 @@ function wire() {
   });
 
   on('#refLoad', 'click', pickReference);
-  on('#refReplace', 'click', pickReference);
-  on('#refRemove', 'click', () => removeReference());
-  on('#refVisible', 'change', e => toggleRef(e.target.checked));
   on('#refOpacity', 'input', e => {
-    ref.opacity = +e.target.value / 100;
+    sel.opacity = +e.target.value / 100;
     $('#refOpacityOut').textContent = `${e.target.value}%`;
     requestRender();
     changed();
   });
-  on('#refSound', 'change', e => {
-    ref.sound = e.target.checked;
-    changed();
+  on('#refXform', 'click', () => setXform());
+  on('#refFlip', 'click', () => flipRef());
+  on('#refReset', 'click', () => resetRef());
+  on('#xfBadge', 'click', e => {
+    const a = e.target.closest('[data-xf]')?.dataset.xf;
+    if (a === 'flip') flipRef();
+    else if (a === 'reset') resetRef();
+    else if (a === 'done') setXform(false);
   });
+  on('#refSound', 'change', e => setRefSound(sel, e.target.checked));
   on('#refOffset', 'change', e => {
-    ref.offset = clamp(Math.round(+e.target.value || 0), 0, ref.frameCount - 1);
-    e.target.value = ref.offset;
-    relayoutVideo();
+    sel.offset = clamp(Math.round(+e.target.value || 0), 0, sel.frameCount - 1);
+    e.target.value = sel.offset;
+    layoutVideo(sel);
+    syncReference();
     changed();
   });
   on('#refFill', 'click', fillToVideo);
@@ -1872,7 +2365,8 @@ function wire() {
   });
   on('#fps', 'change', e => {
     doc.fps = clamp(+e.target.value || doc.fps, 1, 120);
-    if (ref?.kind === 'video' && Math.abs(doc.fps - ref.fps) < 0.01) doc.fps = ref.fps; // typed 29.97, means the video's own rate
+    const same = videos().find(v => Math.abs(doc.fps - v.fps) < 0.01);
+    if (same) doc.fps = same.fps; // typed 29.97, means the video's own rate
     e.target.value = Math.round(doc.fps * 1000) / 1000;
     relayoutVideo();
     changed();
@@ -1930,18 +2424,6 @@ function toggleOnion(v = !prefs.onion.on) {
   requestRender();
 }
 
-function toggleRef(v = !ref?.visible) {
-  if (!ref) return;
-  ref.visible = v;
-  if (playing && ref.kind === 'video') {
-    if (v) ref.play(Math.floor(clock() * doc.fps), clock);
-    else ref.stop();
-  }
-  syncReference();
-  refreshUI();
-  changed();
-}
-
 function toggleMirror() {
   view.mirror = !view.mirror;
   applyView();
@@ -1977,7 +2459,7 @@ addEventListener('keydown', e => {
     if (e.key === 'Escape' || e.key === 'Enter') e.target.blur();
     return;
   }
-  if (!doc || stroke) {
+  if (!doc || stroke || drag) {
     if (e.code === 'Tab') e.preventDefault(); // mid-stroke: ignored, and the focus stays put
     return;
   }
@@ -1992,6 +2474,7 @@ addEventListener('keydown', e => {
     else if (k === 'KeyN') guarded(newProject);
     else if (k === 'KeyE') guarded(exportDialog);
     else if (k === 'KeyI') pickReference();
+    else if (k === 'KeyT') setXform();
     else if (k === 'Digit0' || k === 'Numpad0') fit();
     else if (k === 'Digit1') zoomAt(1 / view.zoom, stage.clientWidth / 2, stage.clientHeight / 2);
     else if (k === 'Equal' || k === 'NumpadAdd') zoomAt(1.25, stage.clientWidth / 2, stage.clientHeight / 2);
@@ -2018,13 +2501,17 @@ addEventListener('keydown', e => {
   else if (/^Digit[1-6]$/.test(k)) setColor(PALETTE[+k.slice(5) - 1]);
   else if (k === 'KeyN') addFrame();
   else if (k === 'KeyD') duplicateFrame();
+  else if ((k === 'Delete' || k === 'Backspace') && xform) handled = true; // the frame is not what is being edited
   else if (k === 'Delete' || k === 'Backspace') e.shiftKey ? deleteFrame() : clearFrame();
   else if (k === 'Minus' || k === 'NumpadSubtract') changeHold(-1);
   else if (k === 'Equal' || k === 'NumpadAdd') changeHold(1);
   else if (k === 'KeyO') toggleOnion();
   else if (k === 'Tab') setEditSketch();
+  else if (k === 'KeyT') setXform();
+  else if (k === 'KeyH' && xform) flipRef();
+  else if ((k === 'Escape' || k === 'Enter' || k === 'NumpadEnter') && xform) setXform(false);
   else if (k === 'Escape' && editSketch) setEditSketch(false);
-  else if (k === 'KeyR') e.shiftKey ? toggleSketch() : toggleRef();
+  else if (k === 'KeyR') e.shiftKey ? toggleSketch() : toggleRefs();
   else if (k === 'KeyM') toggleMirror();
   else if (k === 'Digit0' || k === 'Numpad0') fit();
   else if (k === 'Enter' || k === 'NumpadEnter') togglePlay();
@@ -2079,7 +2566,11 @@ start();
 window.__af = {
   get doc() { return doc; },
   get cur() { return cur; },
-  get ref() { return ref; },
+  get ref() { return sel; },
+  get refs() { return refs; },
+  get xform() { return xform; },
+  setXform,
+  selectRef: i => selectRef(refs[i]),
   get prefs() { return prefs; },
   get playing() { return !!playing; },
   get undoDepth() { return undoStack.length; },
@@ -2089,7 +2580,7 @@ window.__af = {
   perf,
   setDoc,
   go,
-  loadReference,
+  loadReference: async (file, o) => void (await loadReference(file, o)),
   exportTo,
   save: async file => af.saveProject(file, await serialize()),
   open: async file => applyProject(await af.loadProject(file), file),

@@ -26,8 +26,10 @@ const rgbaSample = (px, W, H, timestamp, duration) =>
 
 class Cancelled extends Error {}
 
-// src: { width, height, fps, frames, ticks (start tick per frame + total), frameAtTick(t), video, image,
-//        render(W, H, { frame, under, image, paper }) -> RGBA, unpremultiply(px) }
+// src: { width, height, fps, frames, ticks (start tick per frame + total), frameAtTick(t),
+//        video (the lowest visible video reference: it drives the timing and gives the sound), videos (all visible
+//        video references), render(W, H, { frame, refs, unders, paper, sketch }) -> RGBA, unpremultiply(px) }
+//        unders: Map video reference -> its decoded frame for this picture.
 // job: { kind: 'png' | 'gif' | 'mp4' | 'webm', target, name, scale, withRef, withSketch, transparent, audio }
 export async function runExport(src, job, progress, cancel) {
   const even = job.kind === 'mp4' || job.kind === 'webm';
@@ -37,14 +39,15 @@ export async function runExport(src, job, progress, cancel) {
   };
   const W = fit(src.width);
   const H = fit(src.height);
-  const video = job.withRef && src.video ? src.video : null;
-  const image = job.withRef && !video && src.image;
+  const refs = !!job.withRef;
+  const video = refs && src.video ? src.video : null;
+  const others = video ? src.videos.filter(v => v !== video) : [];
   const paper = !(job.transparent && job.kind === 'png');
   const check = () => {
     if (cancel.requested) throw new Cancelled();
   };
   const sketch = !!job.withSketch;
-  const picture = (frame, under) => src.render(W, H, { frame, under, image, paper, sketch });
+  const picture = (frame, unders) => src.render(W, H, { frame, refs, unders, paper, sketch });
 
   // Ticks to render: the animation, or the whole video at the animation's frame rate.
   const total = video ? video.ticks() : src.ticks[src.frames.length];
@@ -52,20 +55,24 @@ export async function runExport(src, job, progress, cancel) {
 
   async function* pictures() {
     if (!video) {
-      for (let t = 0; t < total; t++) yield { t, frame: frameAt(t), under: null };
+      for (let t = 0; t < total; t++) yield { t, frame: frameAt(t), unders: null };
       return;
     }
-    const r = video.rect;
-    const sink = new CanvasSink(video.track, {
-      width: Math.max(2, Math.round((r.w * W) / src.width)),
-      height: Math.max(2, Math.round((r.h * H) / src.height)),
-      fit: 'fill',
-    });
-    const times = Array.from({ length: total }, (_, t) => video.time(t));
-    let t = 0;
-    for await (const wc of sink.canvasesAtTimestamps(times)) {
-      yield { t, frame: frameAt(t), under: wc?.canvas || null };
-      t++;
+    // Every visible video, decoded in step at its own time for each tick. One that ends early holds its last frame.
+    const all = [video, ...others];
+    const iters = all.map(v => frames(v, W / src.width, total));
+    const last = new Map();
+    try {
+      for (let t = 0; t < total; t++) {
+        const got = await Promise.all(iters.map(it => it.next()));
+        all.forEach((v, k) => {
+          const c = got[k].done ? null : got[k].value?.canvas || null;
+          if (c) last.set(v, c);
+        });
+        yield { t, frame: frameAt(t), unders: new Map(last) };
+      }
+    } finally {
+      for (const it of iters) it.return?.();
     }
   }
 
@@ -75,10 +82,10 @@ export async function runExport(src, job, progress, cancel) {
       const ctx = canvas.getContext('2d');
       let last = null;
       let bytes = null;
-      for await (const { t, frame, under } of pictures()) {
+      for await (const { t, frame, unders } of pictures()) {
         check();
-        if (under || frame !== last || !bytes) {
-          const px = picture(frame, under);
+        if (unders || frame !== last || !bytes) {
+          const px = picture(frame, unders);
           if (!paper) src.unpremultiply(px);
           ctx.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), W, H), 0, 0);
           bytes = new Uint8Array(await (await new Promise(r => canvas.toBlob(r, 'image/png'))).arrayBuffer());
@@ -100,9 +107,9 @@ export async function runExport(src, job, progress, cancel) {
         count++;
       };
       if (video) {
-        for await (const { t, frame, under } of pictures()) {
+        for await (const { t, frame, unders } of pictures()) {
           check();
-          add(picture(frame, under), t, t + 1);
+          add(picture(frame, unders), t, t + 1);
           progress((t + 1) / total);
           await tick();
         }
@@ -122,7 +129,7 @@ export async function runExport(src, job, progress, cancel) {
 
     // MP4 / WebM
     const codec = await videoCodec(job.kind, W, H);
-    if (video) return await overVideo(src, job, { W, H, codec, video, frameAt, progress, cancel });
+    if (video) return await overVideo(src, job, { W, H, codec, video, others, frameAt, progress, cancel });
 
     const output = new Output({ format: outputFormat(job.kind), target: new BufferTarget() });
     const source = new VideoSampleSource({ codec, quality: QUALITY_HIGH, keyFrameInterval: 2 });
@@ -147,17 +154,42 @@ export async function runExport(src, job, progress, cancel) {
   }
 }
 
-// Re-encodes the reference video with the drawings painted over every frame; its audio track rides along.
-async function overVideo(src, job, { W, H, codec, video, frameAt, progress, cancel }) {
+// Frames of a video reference for ticks 0, 1, 2…, decoded at its on-sheet size scaled to the export.
+function frames(v, k, total) {
+  const sink = new CanvasSink(v.track, {
+    width: Math.max(2, Math.round(v.size.w * k)),
+    height: Math.max(2, Math.round(v.size.h * k)),
+    fit: 'fill',
+  });
+  const times = Array.from({ length: total }, (_, t) => v.time(t));
+  return sink.canvasesAtTimestamps(times)[Symbol.asyncIterator]();
+}
+
+// Re-encodes the lowest visible reference video with the drawings (and any other visible references) painted over
+// every frame; its audio track rides along.
+async function overVideo(src, job, { W, H, codec, video, others, frameAt, progress, cancel }) {
   const input = await openInput(video.file);
   const output = new Output({ format: outputFormat(job.kind), target: new BufferTarget() });
-  const r = video.rect;
+  const k = W / src.width;
   // The decoded frame is drawn with its rotation applied, at the size it takes in the export.
   const sub = Object.assign(document.createElement('canvas'), {
-    width: Math.max(2, Math.round((r.w * W) / src.width)),
-    height: Math.max(2, Math.round((r.h * H) / src.height)),
+    width: Math.max(2, Math.round(video.size.w * k)),
+    height: Math.max(2, Math.round(video.size.h * k)),
   });
   const subCtx = sub.getContext('2d');
+  // Other videos follow tick by tick; a few spare ticks cover rounding at the end of the clip.
+  const rest = others.map(v => ({ v, it: frames(v, k, video.ticks() + 4), at: -1, canvas: null }));
+  const advance = async (o, t) => {
+    while (o.at < t) {
+      const got = await o.it.next();
+      if (got.done) {
+        o.at = Infinity;
+        break;
+      }
+      o.at++;
+      if (got.value?.canvas) o.canvas = got.value.canvas;
+    }
+  };
   const start = video.first + video.offset / video.fps;
   let t0 = null;
   const conversion = await Conversion.init({
@@ -172,13 +204,18 @@ async function overVideo(src, job, { W, H, codec, video, frameAt, progress, canc
       allowTransformationMetadata: false,
       processedWidth: W,
       processedHeight: H,
-      process: sample => {
+      process: async sample => {
         // The drawing shown on a video frame is the one exposed at the middle of that frame. Sampling the middle
         // keeps 29.97 vs 30000/1001 style rounding from sliding a drawing onto the neighbouring frame.
         if (t0 === null) t0 = sample.timestamp;
         const t = Math.floor((sample.timestamp - t0 + (sample.duration || 1 / video.fps) / 2) * src.fps);
         sample.drawWithFit(subCtx, { fit: 'fill' });
-        const px = src.render(W, H, { frame: frameAt(t), under: sub, sketch: !!job.withSketch });
+        const unders = new Map([[video, sub]]);
+        for (const o of rest) {
+          await advance(o, t);
+          if (o.canvas) unders.set(o.v, o.canvas);
+        }
+        const px = src.render(W, H, { frame: frameAt(t), refs: true, unders, sketch: !!job.withSketch });
         return rgbaSample(px, W, H, sample.timestamp, sample.duration);
       },
     },
@@ -195,6 +232,7 @@ async function overVideo(src, job, { W, H, codec, video, frameAt, progress, canc
     throw err;
   } finally {
     input.dispose?.();
+    for (const o of rest) o.it.return?.();
   }
   await af.write(job.target, new Uint8Array(output.target.buffer));
   return { file: job.target, codec, audio: job.audio && video.hasAudio && !audioLost, audioLost };

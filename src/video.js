@@ -54,12 +54,16 @@ export class VideoRef {
     this.onFrame = () => {};
   }
 
-  // Sets the area the video occupies on the sheet: contain-fit into the project frame.
-  layout(docW, docH, fps, offset) {
+  // Sets the area the video occupies on the sheet before any transform (contain-fit into the project frame) and the
+  // size frames are decoded at: that area times k, so a video scaled up on the sheet stays sharp.
+  layout(docW, docH, fps, offset, k = 1) {
     const s = Math.min(docW / this.width, docH / this.height);
-    const w = Math.max(2, Math.round(this.width * s));
-    const h = Math.max(2, Math.round(this.height * s));
-    this.rect = { x: Math.round((docW - w) / 2), y: Math.round((docH - h) / 2), w, h };
+    const rw = Math.max(2, Math.round(this.width * s));
+    const rh = Math.max(2, Math.round(this.height * s));
+    this.rect = { x: Math.round((docW - rw) / 2), y: Math.round((docH - rh) / 2), w: rw, h: rh };
+    const w = Math.max(2, Math.round(rw * k));
+    const h = Math.max(2, Math.round(rh * k));
+    this.size = { w, h };
     this.docFps = fps;
     this.offset = offset || 0; // in video frames
     this.sink = new CanvasSink(this.track, { width: w, height: h, fit: 'fill' });

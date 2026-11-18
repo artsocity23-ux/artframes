@@ -248,6 +248,48 @@ body.sketching #stage::after { content: ""; position: absolute; inset: 0; box-sh
 body.sketching #cursor i { box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), inset 0 0 0 1.5px var(--sketch); }
 body.sketching #strip { opacity: .45; }
 
+/* Transforming a reference: a frame with handles over the stage (drawn by app.js), a bar with the moves, cursors
+   that say what a drag will do. The brush ring is not needed. */
+#xfFrame { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; display: none; overflow: visible; }
+body.xforming #xfFrame { display: block; }
+#xfFrame .other { fill: none; stroke: rgba(255, 255, 255, .45); stroke-width: 1; stroke-dasharray: 4 4; }
+#xfFrame .shade { fill: none; stroke: rgba(0, 0, 0, .55); stroke-width: 3.5; }
+#xfFrame .frame { fill: none; stroke: #fff; stroke-width: 1.5; }
+#xfFrame .stick { stroke: #fff; stroke-width: 1.5; }
+#xfFrame .handle, #xfFrame .knob { fill: #fff; stroke: rgba(0, 0, 0, .75); stroke-width: 1.5; }
+#xfFrame .knob { fill: var(--accent); }
+#xfBadge {
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 4px 4px 4px 12px;
+  border-radius: 8px;
+  background: rgba(21, 23, 28, .92);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .14);
+  font-size: 12.5px;
+  z-index: 3;
+  pointer-events: none; /* handles under the note stay reachable; only its buttons take the pen */
+}
+body.xforming #xfBadge { display: flex; }
+#xfBadge button { pointer-events: auto; }
+#xfBadge span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+#xfBadge span b { color: var(--text); font-weight: 600; margin-right: 8px; }
+#xfBadge kbd { margin: 0 3px; }
+#xfBadge button { height: 28px; background: var(--hi); }
+#xfBadge button.primary { background: var(--accent); padding: 0 12px; }
+#stage.xform #cursor { display: none; }
+#stage.xform[data-zone="move"] { cursor: move; }
+#stage.xform[data-zone="nwse"] { cursor: nwse-resize; }
+#stage.xform[data-zone="nesw"] { cursor: nesw-resize; }
+#stage.xform.space[data-zone], #stage.xform.panning[data-zone] { cursor: grab; }
+#stage.xform.panning[data-zone] { cursor: grabbing; }
+#xfBtn.on, #refXform.on { background: var(--on); box-shadow: inset 0 0 0 1px var(--accent); }
+
 #dropHint {
   position: absolute;
   inset: 16px;
@@ -325,8 +367,20 @@ button.ghostbtn { background: none; color: var(--dim); }
 .pair button.wide { flex: 1; min-width: 0; padding: 0 6px; }
 .dimkey { color: var(--dim); font-size: 11px; margin-left: 4px; }
 
-.refname { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
-.refname b { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+/* Reference layers, the top one first. */
+#refList { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
+#refList:empty { display: none; }
+.layer { display: flex; align-items: center; gap: 2px; min-height: 32px; padding: 0 2px 0 0; border-radius: 7px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); cursor: pointer; }
+.layer:hover { box-shadow: inset 0 0 0 1px #3b414d; }
+.layer.sel { box-shadow: inset 0 0 0 1.5px var(--accent); background: #22252d; }
+.layer b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.layer.off b, .layer.off .kind { opacity: .45; }
+.layer button { height: 28px; min-width: 24px; padding: 0 3px; color: var(--dim); }
+.layer button:hover { color: var(--text); }
+.layer button svg { width: 16px; height: 16px; }
+.layer .kind { display: inline-flex; color: var(--dim); margin-right: 2px; }
+.layer .kind svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+.layer .x { font-size: 16px; }
 .x { height: 24px; min-width: 24px; padding: 0; color: var(--dim); font-size: 17px; }
 .x:hover { color: var(--text); }
 
