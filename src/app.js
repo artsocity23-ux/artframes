@@ -810,12 +810,22 @@ const describe = el => (!el ? '-' : el.id ? `#${el.id}` : el.classList?.length ?
 
 const trail = []; // the last 50 pointer, key and focus events; moves of one pointer over one element merge
 let lastPointerType = null;
+// Switches between pen and mouse. A Wacom driver interleaves mouse moves with the pen's several times a second, so
+// the log gets the first switch and then a count at most every 10 s.
+const switches = { n: 0, at: -Infinity };
 
 function remember(e) {
   const t = Math.round(performance.now());
   const on = describe(e.target);
   if (e.pointerType && e.pointerType !== lastPointerType) {
-    af.log(`cursor: pointer type ${lastPointerType || '-'} -> ${e.pointerType}#${e.pointerId} (${e.type})`);
+    if (t - switches.at > 10000) {
+      const more = switches.n ? `; ${switches.n} more switches since the last line` : '';
+      af.log(`cursor: pointer type ${lastPointerType || '-'} -> ${e.pointerType}#${e.pointerId} (${e.type})${more}`);
+      switches.n = 0;
+      switches.at = t;
+    } else {
+      switches.n++;
+    }
     lastPointerType = e.pointerType;
   }
   const last = trail[trail.length - 1];
@@ -1099,6 +1109,43 @@ function fillToVideo() {
 async function pickReference() {
   const file = await af.openDialog('reference');
   if (file) await guarded(() => loadReference(file));
+}
+
+// Ctrl+V: a picture on the clipboard (a screenshot, a frame copied from a player, ArtNote's PNG) becomes the
+// reference just like an opened picture and travels inside the project; a picture or video file copied in Explorer
+// opens from where it is. In number fields Ctrl+V stays an ordinary paste.
+document.addEventListener('paste', e => {
+  if (!doc || typing(e.target) || $('#modal').childElementCount) return;
+  e.preventDefault();
+  guarded(() => pasteReference(e.clipboardData));
+});
+
+async function pasteReference(data) {
+  const supported = name => {
+    const ext = name.split('.').pop().toLowerCase();
+    return VIDEO_EXT.has(ext) || IMAGE_EXT.has(ext);
+  };
+  const files = [...(data?.files || [])];
+  const copied = files.map(f => af.pathForFile(f)).find(p => p && supported(p));
+  if (copied) {
+    await loadReference(copied);
+    return toast(`Референс із буфера: ${basename(copied)}`);
+  }
+  const image = files.find(f => f.type.startsWith('image/')) ||
+    [...(data?.items || [])].find(i => i.kind === 'file' && i.type.startsWith('image/'))?.getAsFile();
+  if (image) {
+    const ext = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp' }[image.type] || 'png';
+    const name = `Вставлено ${new Date().toLocaleString('sv').replace(/:/g, '-')}.${ext}`;
+    await loadReference(name, { bytes: new Uint8Array(await image.arrayBuffer()) });
+    return toast('Референс вставлено з буфера');
+  }
+  // A path copied as text ("Copy as path" in Explorer puts it in quotes).
+  const text = (data?.getData('text/plain') || '').trim().replace(/^"(.*)"$/, '$1');
+  if (/^([a-z]:[\\/]|\\\\|\/)/i.test(text) && supported(text) && (await af.stat(text))) {
+    await loadReference(text);
+    return toast(`Референс із буфера: ${basename(text)}`);
+  }
+  toast('У буфері немає картинки: скопіюй картинку або файл картинки чи відео й натисни Ctrl+V');
 }
 
 // ---------- own reference ----------
@@ -1607,6 +1654,7 @@ const KEYS = [
   ['Пробіл', 'грати / пауза · затиснути й тягнути — рух полотна'],
   ['O', 'калька (onion skin)'],
   ['R', 'показати / сховати референс · Shift+R — свій референс · Ctrl+I — завантажити'],
+  ['Ctrl+V', 'вставити референс з буфера: картинку чи скопійований файл картинки або відео'],
   ['M', 'віддзеркалити полотно'],
   ['Колесо', 'масштаб · 0 — вмістити · середня кнопка — рух'],
   ['Ctrl+Z', 'скасувати · Ctrl+Shift+Z / Ctrl+Y — повторити'],

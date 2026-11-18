@@ -5,10 +5,43 @@
 // and exports PNG, GIF, WebM and MP4.
 // Writes report.json plus screenshots; exits 1 if any check fails.
 const { app, BrowserWindow } = require('electron');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
+
+// The clipboard belongs to whoever runs the test. Electron 45 can only read and write text there, so Windows
+// PowerShell keeps what was on it (copied files, a picture or text) and puts it back; it also places copied files
+// the way Explorer does. Paths travel in environment variables, never inside the script text.
+const clipboardPS = (script, env = {}) => execFileSync('powershell.exe', ['-NoProfile', '-STA', '-Command',
+  `Add-Type -AssemblyName System.Windows.Forms, System.Drawing; $Clip = [System.Windows.Forms.Clipboard]; ${script}`],
+{ encoding: 'utf8', env: { ...process.env, ...env } }).trim();
+function clipboardSave(dir) {
+  const png = path.join(dir, 'clipboard-saved.png');
+  const txt = path.join(dir, 'clipboard-saved.txt');
+  const kind = clipboardPS(`
+    if ($Clip::ContainsFileDropList()) { $o = @{ kind = 'files'; files = @($Clip::GetFileDropList()) } }
+    elseif ($Clip::ContainsImage()) { $Clip::GetImage().Save($env:AF_PNG, [System.Drawing.Imaging.ImageFormat]::Png); $o = @{ kind = 'image' } }
+    elseif ($Clip::ContainsText()) { [IO.File]::WriteAllText($env:AF_TXT, $Clip::GetText(), (New-Object Text.UTF8Encoding $false)); $o = @{ kind = 'text' } }
+    else { $o = @{ kind = 'none' } }
+    $o | ConvertTo-Json -Compress`, { AF_PNG: png, AF_TXT: txt });
+  return { ...JSON.parse(kind), png, txt };
+}
+function clipboardRestore(saved) {
+  clipboardPS(`
+    $s = $env:AF_CLIP | ConvertFrom-Json
+    if ($s.kind -eq 'files') { $list = New-Object System.Collections.Specialized.StringCollection; foreach ($f in $s.files) { [void]$list.Add($f) }; $Clip::SetFileDropList($list) }
+    elseif ($s.kind -eq 'image') { $i = [System.Drawing.Image]::FromFile($s.png); $Clip::SetImage($i); $i.Dispose() }
+    elseif ($s.kind -eq 'text' -and (Get-Item $s.txt).Length -gt 0) { $Clip::SetText([IO.File]::ReadAllText($s.txt, [Text.Encoding]::UTF8)) }
+    else { $Clip::Clear() }`, { AF_CLIP: JSON.stringify(saved) });
+  fs.rmSync(saved.png, { force: true });
+  fs.rmSync(saved.txt, { force: true });
+}
+const clipboardFiles = files => clipboardPS(`
+  $list = New-Object System.Collections.Specialized.StringCollection; foreach ($f in ($env:AF_FILES | ConvertFrom-Json)) { [void]$list.Add($f) }; $Clip::SetFileDropList($list)`,
+{ AF_FILES: JSON.stringify(files) });
+const clipboardText = text => clipboardPS('$Clip::SetText($env:AF_TEXT)', { AF_TEXT: text });
 
 // Counts the images in a GIF and sums their delays (walks the block structure; image data may contain any byte).
 function gifInfo(buf) {
@@ -696,6 +729,71 @@ module.exports = async function selftest({ win, out }) {
     { ...net, cross: net.cross.slice(0, 40) });
   await js(`__af.open(${JSON.stringify(project)})`);
 
+  // ---------- 12. Ctrl+V: a reference from the clipboard ----------
+  // A picture (as ArtNote puts it there), a video file copied in Explorer, plain text (a hint, nothing breaks), and
+  // Ctrl+V in a number field (an ordinary paste). Real key presses; the clipboard is put back right after.
+  if (process.platform === 'win32') {
+    const pasted = {};
+    const saved = clipboardSave(out);
+    pasted.savedKind = saved.kind;
+    const refNow = () => js(`({ kind: __af.ref && __af.ref.kind, name: __af.ref && __af.ref.name, file: __af.ref && __af.ref.file,
+      centre: __af.ref ? __t.refPixel(640, 360) : null, toast: document.getElementById('toast').textContent,
+      err: document.getElementById('toast').classList.contains('err') })`);
+    try {
+      await js("document.activeElement && document.activeElement.blur(); true");
+      await js(`(async () => {
+        const c = document.createElement('canvas'); c.width = 800; c.height = 800;
+        const g = c.getContext('2d');
+        g.fillStyle = '#f3e3c8'; g.fillRect(0, 0, 800, 800);
+        g.fillStyle = '#2a7a4b'; g.fillRect(300, 300, 200, 200);
+        const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+        await af.write(${JSON.stringify(path.join(out, 'paste.png'))}, new Uint8Array(await blob.arrayBuffer()));
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          return 'png';
+        } catch {
+          return null;
+        }
+      })()`).then(how => {
+        pasted.placedAs = how || 'bitmap';
+        if (!how) clipboardPS('$i = [System.Drawing.Image]::FromFile($env:AF_PNG); $Clip::SetImage($i); $i.Dispose()', { AF_PNG: path.join(out, 'paste.png') });
+      });
+      await key('V', ['control']);
+      await wait(700);
+      pasted.picture = await refNow();
+      const pastedFile = path.join(out, 'pasted.artframes');
+      await js(`__af.save(${JSON.stringify(pastedFile)})`);
+      await js(`__af.open(${JSON.stringify(project)})`);
+      await js(`__af.open(${JSON.stringify(pastedFile)})`);
+      pasted.reopened = await refNow();
+      clipboardFiles([videoFile]);
+      await key('V', ['control']);
+      await wait(1200);
+      pasted.videoFile = await refNow();
+      clipboardText('просто текст');
+      await key('V', ['control']);
+      await wait(400);
+      pasted.text = await refNow();
+      clipboardText('30');
+      await js("(() => { const f = document.getElementById('fps'); f.focus(); f.value = ''; return true; })()");
+      await key('V', ['control']);
+      await wait(200);
+      pasted.numberField = { value: await js("document.getElementById('fps').value"), ref: (await refNow()).kind };
+      await key('Escape');
+    } finally {
+      clipboardRestore(saved);
+    }
+    const green = px => px && px[1] > px[0] + 50 && px[1] > px[2] + 30;
+    check('Ctrl+V pastes a reference',
+      pasted.picture.kind === 'image' && green(pasted.picture.centre) && /^Вставлено /.test(pasted.picture.name) &&
+        pasted.reopened.kind === 'image' && green(pasted.reopened.centre) &&
+        pasted.videoFile.kind === 'video' && pasted.videoFile.file === videoFile &&
+        pasted.text.kind === 'video' && /немає картинки/.test(pasted.text.toast) && !pasted.text.err &&
+        pasted.numberField.value === '30' && pasted.numberField.ref === 'video',
+      pasted);
+    await js(`__af.open(${JSON.stringify(project)})`);
+  }
+
   // Donate window from donate.json.
   await js('af.openDonate(); true');
   let donateWin = null;
@@ -730,7 +828,7 @@ module.exports = async function selftest({ win, out }) {
   await shot('help.png');
   await key('Escape');
 
-  // ---------- 12. a big brush on a 4K sheet stays smooth ----------
+  // ---------- 13. a big brush on a 4K sheet stays smooth ----------
   await js('__af.setDoc({ width: 3840, height: 2160, fps: 24 })');
   await wait(300);
   await measure();
