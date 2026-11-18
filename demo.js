@@ -401,6 +401,91 @@ module.exports = async function demo({ win, out }) {
   });
 
   fs.rmSync(video, { force: true });
+
+  // ---------- 4. a composition from two pictures: reference layers and the transform frame ----------
+  const scenery = path.join(out, 'scenery.png');
+  const tree = path.join(out, 'tree.png');
+  await js(`(async () => {
+    const save = async (c, file) => af.write(file, new Uint8Array(await (await new Promise(r => c.toBlob(r, 'image/png'))).arrayBuffer()));
+    const a = document.createElement('canvas'); a.width = 800; a.height = 450;
+    let g = a.getContext('2d');
+    g.fillStyle = '#8ec3ea'; g.fillRect(0, 0, 800, 450);
+    g.fillStyle = '#ffffff';
+    for (const [cx, cy, s] of [[150, 80, 1], [560, 60, 1.2]]) {
+      g.beginPath(); g.ellipse(cx, cy, 50 * s, 17 * s, 0, 0, Math.PI * 2); g.ellipse(cx + 24 * s, cy - 13 * s, 28 * s, 19 * s, 0, 0, Math.PI * 2); g.fill();
+    }
+    g.fillStyle = '#7fae5f'; g.beginPath(); g.ellipse(220, 450, 380, 150, 0, Math.PI, 0); g.fill();
+    g.fillStyle = '#6a9a4e'; g.beginPath(); g.ellipse(640, 460, 330, 120, 0, Math.PI, 0); g.fill();
+    await save(a, ${JSON.stringify(scenery)});
+    // A tree on a transparent ground, apples on one side so the mirror shows.
+    const b = document.createElement('canvas'); b.width = 400; b.height = 500;
+    g = b.getContext('2d');
+    g.fillStyle = '#7a5230'; g.fillRect(180, 280, 40, 210);
+    g.fillStyle = '#3f8a3a';
+    for (const [x, y, r] of [[200, 170, 120], [120, 250, 85], [285, 250, 85], [200, 290, 90]]) { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
+    g.fillStyle = '#d8432f';
+    for (const [x, y] of [[290, 200], [320, 260], [255, 300], [300, 120]]) { g.beginPath(); g.arc(x, y, 13, 0, Math.PI * 2); g.fill(); }
+    await save(b, ${JSON.stringify(tree)});
+    return true;
+  })()`);
+  await fresh(1280, 720, 12);
+  const docAt = (x, y) => at(x / 1280, y / 720);
+  const eased = (a, b, n = 22) => Array.from({ length: n + 1 }, (_, i) => {
+    const s = i / n;
+    const e = s * s * (3 - 2 * s);
+    return [a[0] + (b[0] - a[0]) * e, a[1] + (b[1] - a[1]) * e, 0.5];
+  });
+  // A gull: two arcs meeting in the middle.
+  const gull = (x, y, s) => Array.from({ length: 17 }, (_, i) => {
+    const u = (i / 16) * 2 - 1;
+    return [...docAt(x + 42 * s * u, y - 17 * s * Math.sin(Math.PI * Math.abs(u))), 0.7];
+  });
+  await record('layers', async () => {
+    await wait(400);
+    await caption(`перетягни картинку або ${kbd('Ctrl+V')}новий шар`);
+    await wait(700);
+    await js(`__af.loadReference(${JSON.stringify(scenery)})`);
+    await wait(700);
+    await js(`__af.loadReference(${JSON.stringify(tree)})`);
+    await wait(900);
+    await caption(`${kbd('T')}трансформувати`);
+    await wait(500);
+    await key('T');
+    await wait(400);
+    // The tree fits the sheet at first: 576 x 720 from x 352.
+    await caption('кут — масштаб');
+    await pen(eased(docAt(928, 720), docAt(611, 324)), 16);
+    await wait(250);
+    await caption('тягни — рух');
+    await pen(eased(docAt(481, 162), docAt(300, 420)), 16);
+    await wait(250);
+    await caption('кружок — поворот');
+    const C = docAt(300.5, 420);
+    const M = docAt(300.5, 258);
+    const R = Math.hypot(M[0] - C[0], M[1] - C[1]) + 30; // the knob is 30 px over the top edge
+    await pen(Array.from({ length: 21 }, (_, k) => {
+      const a = -Math.PI / 2 - (k / 20) * 0.26;
+      return [C[0] + R * Math.cos(a), C[1] + R * Math.sin(a), 0.5];
+    }), 18);
+    await wait(250);
+    await caption(`${kbd('H')}дзеркало`);
+    await wait(400);
+    await key('H');
+    await wait(600);
+    await caption(`${kbd('Enter')}готово, малюю поверх`);
+    await wait(400);
+    await key('Enter');
+    await key('B');
+    await key('1');
+    await js('__af.setSize(7); true');
+    await wait(200);
+    await pen(gull(880, 200, 1), 12);
+    await pen(gull(1010, 150, 0.7), 12);
+    await wait(1000);
+  });
+  fs.rmSync(scenery, { force: true });
+  fs.rmSync(tree, { force: true });
+
   fs.writeFileSync(path.join(out, 'demo.json'), JSON.stringify(report, null, 2));
   wc.debugger.detach();
   await wait(300);
